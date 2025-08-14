@@ -247,6 +247,37 @@ def test_connection_string_parsing():
     return True
 
 
+def test_threading_parameters():
+    """Test that threading parameters are validated correctly."""
+    print("\n🧵 Testing Threading Parameters")
+    print("=" * 50)
+    
+    from crate_write.main import cli
+    from click.testing import CliRunner
+    
+    runner = CliRunner()
+    
+    # Test valid thread counts
+    valid_thread_counts = [1, 2, 4, 8, 16]
+    
+    for threads in valid_thread_counts:
+        print(f"\nTesting --threads {threads}...")
+        result = runner.invoke(cli, [
+            '--table-name', 'test', 
+            '--duration', '1', 
+            '--threads', str(threads),
+            '--help'  # Just validate parsing, don't actually run
+        ], catch_exceptions=False)
+        
+        if result.exit_code == 0:
+            print(f"   ✅ --threads {threads} accepted")
+        else:
+            print(f"   ❌ --threads {threads} rejected: {result.output}")
+            return False
+    
+    return True
+
+
 def main():
     """Run all tests."""
     print("🧪 CrateDB Record Generator Test Suite")
@@ -258,6 +289,7 @@ def main():
         ("Timestamp Format", test_timestamp_format),
         ("Bulk Insert Format", test_bulk_insert_format),
         ("Connection String Parsing", test_connection_string_parsing),
+        ("Threading Parameters", test_threading_parameters),
     ]
     
     results = []

@@ -26,43 +26,43 @@ from urllib.parse import urlparse
 
 class CrateDBClient:
     """Simple HTTP client for CrateDB."""
-    
+
     def __init__(self, connection_string: str):
         """Initialize the CrateDB client."""
         # Clean up malformed URLs (e.g., https:/// -> https://)
         cleaned_url = connection_string.replace("://:", "://").replace(":///", "://")
-        
+
         try:
             parsed = urlparse(cleaned_url)
-            
+
             # Validate required components
             if not parsed.scheme:
                 raise ValueError(f"Missing scheme in connection string: {connection_string}")
             if not parsed.hostname:
                 raise ValueError(f"Missing hostname in connection string: {connection_string}")
-            
+
             self.base_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 4200}"
             self.auth = None
-            
+
             if parsed.username and parsed.password:
                 self.auth = HTTPBasicAuth(parsed.username, parsed.password)
-            
+
             logger.info(f"Connecting to CrateDB at: {parsed.scheme}://{parsed.hostname}:{parsed.port or 4200}")
-            
+
         except Exception as e:
             logger.error(f"Failed to parse connection string '{connection_string}': {e}")
             raise ValueError(f"Invalid connection string format: {e}")
-        
+
         self.session = requests.Session()
         if self.auth:
             self.session.auth = self.auth
-    
+
     def execute(self, sql: str, args: Optional[List] = None) -> Dict[str, Any]:
         """Execute a SQL statement."""
         payload = {"stmt": sql}
         if args:
             payload["args"] = args
-        
+
         try:
             response = self.session.post(
                 f"{self.base_url}/_sql",
@@ -77,14 +77,14 @@ class CrateDBClient:
             if args:
                 logger.error(f"SQL args: {args}")
             raise
-    
+
     def execute_bulk(self, sql: str, bulk_args: List[List]) -> Dict[str, Any]:
         """Execute a SQL statement with bulk parameters."""
         payload = {
             "stmt": sql,
             "bulk_args": bulk_args
         }
-        
+
         try:
             response = self.session.post(
                 f"{self.base_url}/_sql",
@@ -104,7 +104,7 @@ class CrateDBClient:
 
 class PerformanceMonitor:
     """Monitor and report performance metrics."""
-    
+
     def __init__(self):
         self.start_time = time.time()
         self.total_records = 0
@@ -113,41 +113,41 @@ class PerformanceMonitor:
         self.last_report_records = 0
         self.errors = 0
         self.lock = threading.Lock()
-        
+
     def add_records(self, count: int):
         """Add records to the counter."""
         with self.lock:
             self.total_records += count
             self.total_batches += 1
-    
+
     def add_error(self):
         """Add an error to the counter."""
         with self.lock:
             self.errors += 1
-    
+
     def get_current_rate(self) -> float:
         """Get the current insertion rate (records/second)."""
         with self.lock:
             current_time = time.time()
             time_diff = current_time - self.last_report_time
-            
+
             if time_diff < 1.0:  # Avoid division by very small numbers
                 return 0.0
-            
+
             records_diff = self.total_records - self.last_report_records
             rate = records_diff / time_diff
-            
+
             self.last_report_time = current_time
             self.last_report_records = self.total_records
-            
+
             return rate
-    
+
     def get_overall_stats(self) -> Dict[str, Any]:
         """Get overall performance statistics."""
         with self.lock:
             elapsed_time = time.time() - self.start_time
             overall_rate = self.total_records / elapsed_time if elapsed_time > 0 else 0
-            
+
             return {
                 "total_records": self.total_records,
                 "total_batches": self.total_batches,
@@ -159,7 +159,7 @@ class PerformanceMonitor:
 
 class RecordGenerator:
     """Generate random records for testing."""
-    
+
     def __init__(self):
         self.fake = Faker()
         # Keep cardinality reasonable by limiting choices
@@ -168,13 +168,13 @@ class RecordGenerator:
         self.event_types = ["view", "click", "purchase", "cart_add", "cart_remove"]
         self.user_segments = ["premium", "standard", "basic", "trial"]
         self.base_time = datetime.now(timezone.utc)
-        
+
     def generate_record(self) -> List[Any]:
         """Generate a single random record."""
         # Add slight randomization to timestamp (within last 60 seconds)
         timestamp_offset = timedelta(seconds=random.randint(-60, 0))
         timestamp = (self.base_time + timestamp_offset).isoformat()
-        
+
         return [
             self.fake.uuid4(),  # id
             timestamp,  # timestamp
@@ -191,7 +191,7 @@ class RecordGenerator:
                 "session_id": self.fake.uuid4()
             })  # metadata
         ]
-    
+
     def generate_batch(self, batch_size: int) -> List[List[Any]]:
         """Generate a batch of records."""
         return [self.generate_record() for _ in range(batch_size)]
@@ -212,14 +212,13 @@ def create_table(client: CrateDBClient, table_name: str) -> None:
         quantity INTEGER,
         metadata OBJECT(DYNAMIC)
     ) WITH (
-        number_of_replicas = 0,
-        "refresh_interval" = 1000
+        number_of_replicas = 1
     )
     """
-    
+
     logger.info(f"Creating table: {table_name}")
     logger.info(f"SQL: {create_sql}")
-    
+
     try:
         result = client.execute(create_sql)
         logger.success(f"Table '{table_name}' created successfully")
@@ -230,7 +229,51 @@ def create_table(client: CrateDBClient, table_name: str) -> None:
         raise
 
 
-def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event):
+def worker_thread(worker_id: int, connection_string: str, table_name: str, 
+                 insert_sql: str, batch_size: int, batch_interval: float,
+                 monitor: PerformanceMonitor, stop_event: threading.Event):
+    """Worker thread that generates and inserts records."""
+    thread_logger = logger.bind(worker=worker_id)
+    thread_logger.info(f"Worker {worker_id} starting...")
+    
+    try:
+        # Each worker gets its own client and generator
+        client = CrateDBClient(connection_string)
+        generator = RecordGenerator()
+        
+        while not stop_event.is_set():
+            try:
+                # Generate batch of records
+                batch = generator.generate_batch(batch_size)
+                
+                # Insert batch
+                result = client.execute_bulk(insert_sql, batch)
+                monitor.add_records(batch_size)
+                
+                # Log successful batch (debug level)
+                thread_logger.debug(f"Worker {worker_id} inserted batch of {batch_size} records")
+                
+                # Wait before next batch
+                if batch_interval > 0:
+                    time.sleep(batch_interval)
+                
+            except Exception as e:
+                thread_logger.error(f"Worker {worker_id} error inserting batch: {e}")
+                monitor.add_error()
+                
+                # Exponential backoff on errors
+                error_delay = min(5.0, 1.0 * (monitor.errors + 1))
+                thread_logger.warning(f"Worker {worker_id} waiting {error_delay:.1f}s before retry...")
+                time.sleep(error_delay)
+                
+    except Exception as e:
+        thread_logger.error(f"Worker {worker_id} fatal error: {e}")
+        monitor.add_error()
+    
+    thread_logger.info(f"Worker {worker_id} finished")
+
+
+def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event, num_threads: int):
     """Background thread to report performance every 10 seconds."""
     while not stop_event.wait(10):
         rate = monitor.get_current_rate()
@@ -240,14 +283,16 @@ def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event):
             f"Performance: {rate:.1f} records/sec (current), "
             f"{stats['overall_rate']:.1f} records/sec (avg), "
             f"Total: {stats['total_records']:,} records, "
+            f"Batches: {stats['total_batches']:,}, "
+            f"Threads: {num_threads}, "
             f"Errors: {stats['errors']}"
         )
 
 
 @click.command()
 @click.option(
-    "--table-name", 
-    required=True, 
+    "--table-name",
+    required=True,
     help="Name of the CrateDB table to insert records into"
 )
 @click.option(
@@ -272,17 +317,23 @@ def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event):
     default=0.1,
     help="Interval between batches in seconds (default: 0.1)"
 )
+@click.option(
+    "--threads",
+    type=int,
+    default=1,
+    help="Number of parallel worker threads (default: 1)"
+)
 def cli(table_name: str, connection_string: Optional[str], duration: int, 
-        batch_size: int, batch_interval: float):
+        batch_size: int, batch_interval: float, threads: int):
     """
     Generate and insert random records into CrateDB for testing purposes.
-    
+
     This script generates realistic test data and inserts it into a CrateDB table
     with performance monitoring and reporting.
     """
     # Load environment variables
     load_dotenv()
-    
+
     # Configure logging
     log_level = os.getenv("LOG_LEVEL", "INFO")
     logger.remove()
@@ -291,24 +342,24 @@ def cli(table_name: str, connection_string: Optional[str], duration: int,
         level=log_level,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>"
     )
-    
+
     # Get connection string
     if not connection_string:
         connection_string = os.getenv("CRATE_CONNECTION_STRING")
         if not connection_string:
             logger.error("Connection string not provided via --connection-string or CRATE_CONNECTION_STRING env var")
             sys.exit(1)
-    
+
     logger.info(f"Starting CrateDB record generator")
     logger.info(f"Table: {table_name}")
     logger.info(f"Duration: {duration} minutes")
     logger.info(f"Batch size: {batch_size}")
     logger.info(f"Batch interval: {batch_interval}s")
-    
+    logger.info(f"Worker threads: {threads}")
+
     try:
         # Initialize components
         client = CrateDBClient(connection_string)
-        generator = RecordGenerator()
         monitor = PerformanceMonitor()
         
         # Create table
@@ -325,61 +376,57 @@ def cli(table_name: str, connection_string: Optional[str], duration: int,
         stop_event = threading.Event()
         reporter = threading.Thread(
             target=reporter_thread,
-            args=(monitor, stop_event),
+            args=(monitor, stop_event, threads),
             daemon=True
         )
         reporter.start()
         
-        # Calculate end time
-        end_time = time.time() + (duration * 60)
+        # Start worker threads
+        workers = []
+        for i in range(threads):
+            worker = threading.Thread(
+                target=worker_thread,
+                args=(i, connection_string, table_name, insert_sql, 
+                      batch_size, batch_interval, monitor, stop_event),
+                daemon=True
+            )
+            workers.append(worker)
+            worker.start()
         
-        logger.info("Starting record generation and insertion...")
+        logger.info(f"Started {threads} worker threads...")
         
-        # Main generation loop
-        while time.time() < end_time:
-            try:
-                # Generate batch of records
-                batch = generator.generate_batch(batch_size)
-                
-                # Insert batch
-                result = client.execute_bulk(insert_sql, batch)
-                monitor.add_records(batch_size)
-                
-                # Log successful batch (debug level)
-                logger.debug(f"Successfully inserted batch of {batch_size} records")
-                
-                # Wait before next batch
-                time.sleep(batch_interval)
-                
-            except KeyboardInterrupt:
-                logger.warning("Received interrupt signal, stopping...")
-                break
-            except Exception as e:
-                logger.error(f"Error inserting batch: {e}")
-                logger.error(f"Batch size: {batch_size}")
-                logger.error(f"Insert SQL: {insert_sql}")
-                if 'batch' in locals() and batch:
-                    logger.error(f"Sample record: {batch[0]}")
-                monitor.add_error()
-                
-                # Exponential backoff on errors
-                error_delay = min(5.0, 1.0 * (monitor.errors + 1))
-                logger.warning(f"Waiting {error_delay:.1f}s before retry...")
-                time.sleep(error_delay)
+        # Wait for duration
+        try:
+            time.sleep(duration * 60)
+            logger.info("Duration completed, stopping workers...")
+        except KeyboardInterrupt:
+            logger.warning("Received interrupt signal, stopping workers...")
+        
+        # Signal all threads to stop
+        stop_event.set()
+        
+        # Wait for all workers to finish (with timeout)
+        logger.info("Waiting for workers to finish...")
+        for i, worker in enumerate(workers):
+            worker.join(timeout=5.0)
+            if worker.is_alive():
+                logger.warning(f"Worker {i} did not finish within timeout")
         
         # Stop reporting thread
         stop_event.set()
-        
+
         # Final performance summary
         final_stats = monitor.get_overall_stats()
         
         logger.info("=" * 60)
         logger.info("FINAL PERFORMANCE SUMMARY")
         logger.info("=" * 60)
+        logger.success(f"Worker threads: {threads}")
         logger.success(f"Total records inserted: {final_stats['total_records']:,}")
         logger.success(f"Total batches: {final_stats['total_batches']:,}")
         logger.success(f"Total runtime: {final_stats['elapsed_time']:.1f} seconds")
         logger.success(f"Average insertion rate: {final_stats['overall_rate']:.1f} records/second")
+        logger.success(f"Records per thread: {final_stats['total_records'] // threads:,} avg")
         logger.success(f"Total errors: {final_stats['errors']}")
         
         if final_stats['errors'] > 0:
@@ -387,7 +434,7 @@ def cli(table_name: str, connection_string: Optional[str], duration: int,
             logger.warning(f"Error rate: {error_rate:.2f}%")
         
         logger.info("=" * 60)
-        
+
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         sys.exit(1)

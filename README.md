@@ -109,6 +109,13 @@ crate-write \
     --batch-size 200 \
     --batch-interval 0.05
 
+# High-pressure testing with multiple threads
+crate-write \
+    --table-name stress_test \
+    --duration 5 \
+    --batch-size 100 \
+    --threads 8
+
 # Override connection string
 crate-write \
     --table-name my_table \
@@ -123,6 +130,7 @@ crate-write \
 - `--connection-string`: CrateDB connection string (overrides .env)
 - `--batch-size`: Records per batch (default: 100)
 - `--batch-interval`: Seconds between batches (default: 0.1)
+- `--threads`: Number of parallel worker threads (default: 1)
 
 ## Performance Monitoring
 
@@ -140,10 +148,12 @@ After completion, you'll see a comprehensive performance report:
 ============================================================
 FINAL PERFORMANCE SUMMARY
 ============================================================
+Worker threads: 8
 Total records inserted: 1,234,567
 Total batches: 12,346
 Total runtime: 300.5 seconds
 Average insertion rate: 4,109.2 records/second
+Records per thread: 154,320 avg
 Total errors: 0
 ============================================================
 ```
@@ -158,8 +168,8 @@ Total errors: 0
 2024-01-15 10:30:00 | INFO     | Batch interval: 0.1s
 2024-01-15 10:30:00 | SUCCESS  | Table 'test_events' created successfully
 2024-01-15 10:30:00 | INFO     | Starting record generation and insertion...
-2024-01-15 10:30:10 | INFO     | Performance: 985.2 records/sec (current), 987.1 records/sec (avg), Total: 9,871 records, Errors: 0
-2024-01-15 10:30:20 | INFO     | Performance: 1,002.5 records/sec (current), 993.8 records/sec (avg), Total: 19,876 records, Errors: 0
+2024-01-15 10:30:10 | INFO     | Performance: 985.2 records/sec (current), 987.1 records/sec (avg), Total: 9,871 records, Batches: 98, Threads: 1, Errors: 0
+2024-01-15 10:30:20 | INFO     | Performance: 1,002.5 records/sec (current), 993.8 records/sec (avg), Total: 19,876 records, Batches: 198, Threads: 1, Errors: 0
 ...
 ```
 
@@ -215,8 +225,9 @@ To optimize performance:
 
 1. Increase `--batch-size` for higher throughput
 2. Decrease `--batch-interval` for faster insertion
-3. Ensure CrateDB has sufficient resources
-4. Consider adjusting the table's `refresh_interval`
+3. Increase `--threads` for parallel load (start with CPU cores)
+4. Ensure CrateDB has sufficient resources
+5. Consider adjusting the table's `refresh_interval`
 
 ### Memory Issues
 

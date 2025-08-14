@@ -32,13 +32,16 @@ echo ""
     --table-name demo_events \
     --duration 1 \
     --batch-size 50 \
-    --batch-interval 0.1
+    --batch-interval 0.1 \
+    --threads 2
 
 echo ""
 echo -e "${GREEN}✅ Demo completed!${NC}"
 echo ""
-echo -e "${BLUE}To run your own test:${NC}"
+echo -e "${BLUE}To run your own tests:${NC}"
 echo "  ./run.sh --table-name my_table --duration 5"
+echo "  ./run.sh --table-name stress_test --duration 3 --threads 4"
+echo "  ./run.sh --table-name max_test --duration 2 --threads 8 --batch-size 200"
 echo ""
 echo -e "${BLUE}To see detailed usage:${NC}"
 echo "  ./run.sh --help"
