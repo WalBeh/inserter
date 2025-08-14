@@ -226,8 +226,8 @@ elif [ "$1" = "--extreme" ]; then
         "EXTREME Load Test" \
         "extreme_stress" \
         2 \
-        16 \
-        8000 \
+        32 \
+        6000 \
         0
 
 elif [ "$1" = "--help" ] || [ "$1" = "-h" ]; then

@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS your_table_name (
     amount DOUBLE PRECISION,
     quantity INTEGER,
     metadata OBJECT(DYNAMIC)
+    -- Additional obj_0, obj_1, ... obj_N columns when using --objects flag
 ) WITH (
     number_of_replicas = 0,
     "refresh_interval" = 1000
@@ -78,6 +79,7 @@ CREATE TABLE IF NOT EXISTS your_table_name (
 
 The generated data includes:
 
+**Base Fields (10 columns):**
 - **Regions**: 4 options (us-east, us-west, eu-central, ap-southeast)
 - **Product Categories**: 5 options (electronics, books, clothing, home, sports)
 - **Event Types**: 5 options (view, click, purchase, cart_add, cart_remove)
@@ -86,6 +88,11 @@ The generated data includes:
 - **Amounts**: Random decimals 1.0-1000.0
 - **Quantities**: Random integers 1-100
 - **Metadata**: JSON with browser, OS, and session information
+
+**Object Fields (when using --objects):**
+- **obj_0, obj_1, ... obj_N**: Low cardinality TEXT fields
+- **Values**: Each object has 3-8 possible values (e.g., "val_0", "val_1", "val_2")
+- **Use Cases**: Wide table testing, column performance analysis, realistic schemas
 
 ## Usage
 
@@ -116,6 +123,12 @@ crate-write \
     --batch-size 100 \
     --threads 8
 
+# Wide table testing with many columns
+crate-write \
+    --table-name wide_table \
+    --duration 3 \
+    --objects 100
+
 # Override connection string
 crate-write \
     --table-name my_table \
@@ -131,6 +144,7 @@ crate-write \
 - `--batch-size`: Records per batch (default: 100)
 - `--batch-interval`: Seconds between batches (default: 0.1)
 - `--threads`: Number of parallel worker threads (default: 1)
+- `--objects`: Number of additional low-cardinality object columns (default: 0)
 
 ## Performance Monitoring
 
@@ -160,6 +174,7 @@ Total errors: 0
 
 ## Example Output
 
+### Basic Usage
 ```
 2024-01-15 10:30:00 | INFO     | Starting CrateDB record generator
 2024-01-15 10:30:00 | INFO     | Table: test_events
@@ -169,7 +184,15 @@ Total errors: 0
 2024-01-15 10:30:00 | SUCCESS  | Table 'test_events' created successfully
 2024-01-15 10:30:00 | INFO     | Starting record generation and insertion...
 2024-01-15 10:30:10 | INFO     | Performance: 985.2 records/sec (current), 987.1 records/sec (avg), Total: 9,871 records, Batches: 98, Threads: 1, Errors: 0
-2024-01-15 10:30:20 | INFO     | Performance: 1,002.5 records/sec (current), 993.8 records/sec (avg), Total: 19,876 records, Batches: 198, Threads: 1, Errors: 0
+```
+
+### Wide Table Usage (--objects 50)
+```
+2024-01-15 10:30:00 | INFO     | Starting CrateDB record generator
+2024-01-15 10:30:00 | INFO     | Table: wide_test
+2024-01-15 10:30:00 | INFO     | Object columns: 50
+2024-01-15 10:30:00 | SUCCESS  | Table 'wide_test' created successfully (60 total columns)
+2024-01-15 10:30:10 | INFO     | Performance: 750.3 records/sec (current), 750.3 records/sec (avg), Total: 7,503 records, Batches: 75, Threads: 1, Errors: 0
 ...
 ```
 
