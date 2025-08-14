@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crate-write"
+version = "0.1.0"
+description = "A Python script for generating and inserting records into CrateDB"
+authors = [{ name = "Your Name", email = "your.email@example.com" }]
+dependencies = [
+    "click>=8.1.0",
+    "loguru>=0.7.0",
+    "python-dotenv>=1.0.0",
+    "crate[sqlalchemy]>=0.35.0",
+    "requests>=2.31.0",
+    "faker>=19.0.0",
+]
+requires-python = ">=3.8"
+
+[project.scripts]
+crate-write = "crate_write.main:cli"
+
+[tool.uv]
+dev-dependencies = ["pytest>=7.0.0", "black>=23.0.0", "isort>=5.12.0"]

@@ -1,0 +1,231 @@
+# CrateDB Record Generator
+
+A Python script for generating and inserting random records into CrateDB with performance monitoring and reporting.
+
+## Features
+
+- **Random Data Generation**: Creates realistic test data with controlled cardinality
+- **Bulk Insertions**: Efficient batch insertions to maximize throughput
+- **Performance Monitoring**: Real-time reporting every 10 seconds
+- **Configurable Duration**: Run for a specified number of minutes
+- **CLI Interface**: Easy-to-use command-line interface with Click
+- **Environment Configuration**: Connection strings via `.env` file
+- **Structured Logging**: Beautiful logs with Loguru
+- **Error Handling**: Robust error handling with retry logic
+
+## Installation
+
+This project uses [uv](https://astral.sh/uv) for dependency management. Make sure you have uv installed:
+
+```bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Clone and set up the project:
+
+```bash
+git clone <repository-url>
+cd crate-write
+
+# Create virtual environment and install dependencies
+uv venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+uv pip install -e .
+```
+
+## Configuration
+
+Copy the example `.env` file and configure your CrateDB connection:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` to set your CrateDB connection string:
+
+```env
+# CrateDB connection string
+CRATE_CONNECTION_STRING=http://admin:password@localhost:4200
+
+# Optional: Set log level
+LOG_LEVEL=INFO
+```
+
+## Table Schema
+
+The script creates a table with the following schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS your_table_name (
+    id TEXT PRIMARY KEY,
+    timestamp TIMESTAMP WITH TIME ZONE,
+    region TEXT,
+    product_category TEXT,
+    event_type TEXT,
+    user_id INTEGER,
+    user_segment TEXT,
+    amount DOUBLE PRECISION,
+    quantity INTEGER,
+    metadata OBJECT(DYNAMIC)
+) WITH (
+    number_of_replicas = 0,
+    "refresh_interval" = 1000
+);
+```
+
+### Data Characteristics
+
+The generated data includes:
+
+- **Regions**: 4 options (us-east, us-west, eu-central, ap-southeast)
+- **Product Categories**: 5 options (electronics, books, clothing, home, sports)
+- **Event Types**: 5 options (view, click, purchase, cart_add, cart_remove)
+- **User Segments**: 4 options (premium, standard, basic, trial)
+- **User IDs**: Random integers 1-10,000
+- **Amounts**: Random decimals 1.0-1000.0
+- **Quantities**: Random integers 1-100
+- **Metadata**: JSON with browser, OS, and session information
+
+## Usage
+
+### Basic Usage
+
+```bash
+# Activate virtual environment
+source .venv/bin/activate
+
+# Run for 5 minutes inserting into 'test_events' table
+crate-write --table-name test_events --duration 5
+```
+
+### Advanced Usage
+
+```bash
+# Custom batch size and interval
+crate-write \
+    --table-name my_table \
+    --duration 10 \
+    --batch-size 200 \
+    --batch-interval 0.05
+
+# Override connection string
+crate-write \
+    --table-name my_table \
+    --duration 5 \
+    --connection-string "http://admin:mypass@crate.example.com:4200"
+```
+
+### Command Line Options
+
+- `--table-name`: **Required**. Name of the CrateDB table to create/insert into
+- `--duration`: **Required**. Duration to run in minutes
+- `--connection-string`: CrateDB connection string (overrides .env)
+- `--batch-size`: Records per batch (default: 100)
+- `--batch-interval`: Seconds between batches (default: 0.1)
+
+## Performance Monitoring
+
+The script provides real-time performance monitoring:
+
+### During Execution
+- Reports every 10 seconds with current and average insertion rates
+- Shows total records inserted and error count
+- Displays batch statistics
+
+### Final Summary
+After completion, you'll see a comprehensive performance report:
+
+```
+============================================================
+FINAL PERFORMANCE SUMMARY
+============================================================
+Total records inserted: 1,234,567
+Total batches: 12,346
+Total runtime: 300.5 seconds
+Average insertion rate: 4,109.2 records/second
+Total errors: 0
+============================================================
+```
+
+## Example Output
+
+```
+2024-01-15 10:30:00 | INFO     | Starting CrateDB record generator
+2024-01-15 10:30:00 | INFO     | Table: test_events
+2024-01-15 10:30:00 | INFO     | Duration: 5 minutes
+2024-01-15 10:30:00 | INFO     | Batch size: 100
+2024-01-15 10:30:00 | INFO     | Batch interval: 0.1s
+2024-01-15 10:30:00 | SUCCESS  | Table 'test_events' created successfully
+2024-01-15 10:30:00 | INFO     | Starting record generation and insertion...
+2024-01-15 10:30:10 | INFO     | Performance: 985.2 records/sec (current), 987.1 records/sec (avg), Total: 9,871 records, Errors: 0
+2024-01-15 10:30:20 | INFO     | Performance: 1,002.5 records/sec (current), 993.8 records/sec (avg), Total: 19,876 records, Errors: 0
+...
+```
+
+## Development
+
+### Project Structure
+
+```
+crate-write/
+├── crate_write/
+│   ├── __init__.py
+│   └── main.py          # Main application logic
+├── pyproject.toml       # Project configuration and dependencies
+├── .env                 # Environment configuration
+└── README.md           # This file
+```
+
+### Running in Development
+
+```bash
+# Activate virtual environment
+source .venv/bin/activate
+
+# Install in development mode
+uv pip install -e .
+
+# Run directly with python
+python -m crate_write.main --table-name test --duration 1
+```
+
+### Dependencies
+
+- **click**: Command-line interface
+- **loguru**: Structured logging
+- **python-dotenv**: Environment variable management
+- **crate[sqlalchemy]**: CrateDB Python client
+- **requests**: HTTP client for CrateDB REST API
+- **faker**: Realistic fake data generation
+
+## Troubleshooting
+
+### Connection Issues
+
+If you encounter connection errors:
+
+1. Verify CrateDB is running and accessible
+2. Check the connection string format: `http://[username:password@]host:port`
+3. Ensure firewall allows connections to CrateDB port (default: 4200)
+
+### Performance Issues
+
+To optimize performance:
+
+1. Increase `--batch-size` for higher throughput
+2. Decrease `--batch-interval` for faster insertion
+3. Ensure CrateDB has sufficient resources
+4. Consider adjusting the table's `refresh_interval`
+
+### Memory Issues
+
+For long-running sessions:
+
+1. Monitor memory usage of both the script and CrateDB
+2. Consider reducing batch size if memory usage is high
+3. Ensure adequate swap space is available
+
+## License
+
+This project is licensed under the MIT License.
