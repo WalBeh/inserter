@@ -212,6 +212,224 @@ class RecordGenerator:
         return [self.generate_record() for _ in range(batch_size)]
 
 
+def sample_load_balancer_5tuple(connection_string: str, samples: int = None) -> Dict[str, int]:
+    """Sample load balancer distribution using fresh TCP connections (5-tuple test)."""
+    import socket
+    import ssl
+    import json
+    import base64
+    
+    logger.info("Starting 5-tuple load balancer analysis...")
+
+    parsed = urlparse(connection_string)
+    if not parsed.hostname:
+        raise ValueError("Invalid connection string - missing hostname")
+        
+    host = parsed.hostname
+    port = parsed.port or 4200
+    use_ssl = parsed.scheme == 'https'
+    
+    # Prepare authentication header if needed
+    auth_header = None
+    if parsed.username and parsed.password:
+        credentials = f"{parsed.username}:{parsed.password}"
+        encoded = base64.b64encode(credentials.encode()).decode()
+        auth_header = f"Basic {encoded}"
+
+    # Calculate samples
+    if samples is None:
+        samples = 30
+    
+    logger.info(f"Testing load balancer with {samples} fresh TCP connections...")
+
+    node_counts = {}
+    successful_samples = 0
+    source_ports = []
+
+    for i in range(samples):
+        sock = None
+        try:
+            # Create a fresh TCP socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            
+            # Connect to the server
+            sock.connect((host, port))
+            
+            # Get source port for 5-tuple analysis
+            source_ip, source_port = sock.getsockname()
+            source_ports.append(source_port)
+            
+            # Wrap with SSL if needed
+            if use_ssl:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                sock = context.wrap_socket(sock, server_hostname=host)
+            
+            # Prepare HTTP request
+            http_request = f"GET / HTTP/1.1\r\n"
+            http_request += f"Host: {host}:{port}\r\n"
+            http_request += "Connection: close\r\n"
+            http_request += "User-Agent: CrateDB-5Tuple-Tester/1.0\r\n"
+            
+            if auth_header:
+                http_request += f"Authorization: {auth_header}\r\n"
+            
+            http_request += "\r\n"
+            
+            # Send request and read response
+            sock.sendall(http_request.encode())
+            
+            response_data = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response_data += chunk
+            
+            # Parse HTTP response
+            response_text = response_data.decode('utf-8', errors='ignore')
+            headers, body = response_text.split('\r\n\r\n', 1)
+            
+            # Extract JSON from body
+            try:
+                json_data = json.loads(body)
+                node_name = json_data.get('name', 'unknown')
+                
+                # Simple node name shortening
+                import re
+                match = re.search(r'([a-z]+).*?(\d+)', node_name, re.IGNORECASE)
+                if match:
+                    short_name = f"{match.group(1)}-{match.group(2)}"
+                else:
+                    short_name = node_name[:10]
+                
+                node_counts[short_name] = node_counts.get(short_name, 0) + 1
+                successful_samples += 1
+                
+            except Exception:
+                pass  # Ignore JSON parsing errors
+                
+        except Exception:
+            pass  # Ignore failed connections
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
+        
+        # Small delay to ensure different source ports
+        time.sleep(0.05)
+
+    logger.info(f"5-tuple test complete: {successful_samples}/{samples} successful")
+    
+    if node_counts:
+        unique_ports = len(set(source_ports))
+        unique_nodes = len(node_counts)
+        
+        logger.info(f"Unique source ports: {unique_ports}, Unique nodes hit: {unique_nodes}")
+        
+        # Display visual distribution
+        print("\n📈 NODE DISTRIBUTION:")
+        for node_name, count in sorted(node_counts.items()):
+            percentage = (count / successful_samples) * 100
+            bar_length = int(percentage / 2)  # Scale bar to reasonable length
+            bar = "█" * bar_length
+            print(f"   {node_name:15} | {count:3d} hits | {percentage:5.1f}% | {bar}")
+        
+        # Analysis
+        if unique_nodes == 1 and unique_ports > 5:
+            logger.warning("⚠️  Load balancer may NOT be using 5-tuple distribution")
+            logger.info(f"Evidence: {unique_ports} different source ports, but all hit same node")
+        elif unique_nodes > 1:
+            logger.info("✅ Load balancer IS distributing across nodes")
+            logger.info(f"Evidence: {unique_ports} source ports hit {unique_nodes} different nodes")
+        else:
+            logger.info("❓ Inconclusive results - need more data")
+    
+    return node_counts
+
+
+def sample_load_balancer(connection_string: str, samples: int = None) -> Dict[str, int]:
+    """Sample load balancer distribution with multiple requests."""
+    logger.info("Starting load balancer analysis...")
+
+    # Create temporary session for sampling
+    parsed = urlparse(connection_string)
+    base_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 4200}"
+
+    session = requests.Session()
+    if parsed.username and parsed.password:
+        session.auth = HTTPBasicAuth(parsed.username, parsed.password)
+
+    # First, query sys.nodes to see how many nodes are in the cluster
+    expected_nodes = 1  # Default fallback
+    try:
+        logger.info("Querying sys.nodes to determine cluster size...")
+        payload = {"stmt": "SELECT count(*) as node_count FROM sys.nodes"}
+        response = session.post(
+            f"{base_url}/_sql",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=5
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('rows') and len(data['rows']) > 0:
+                expected_nodes = data['rows'][0][0]
+                logger.info(f"Cluster has {expected_nodes} node(s)")
+        else:
+            logger.warning(f"Failed to query sys.nodes: HTTP {response.status_code}")
+    except Exception as e:
+        logger.warning(f"Could not determine cluster size: {e}")
+        logger.info("Using default assumption of 1 node")
+
+    # Calculate samples: 10 requests per node, minimum 30
+    if samples is None:
+        samples = max(30, expected_nodes * 10)
+
+    logger.info(f"Sampling load balancer with {samples} requests ({samples//expected_nodes} per expected node)...")
+
+    node_counts = {}
+    successful_samples = 0
+
+    for i in range(samples):
+        try:
+            response = session.get(base_url, timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                node_name = data.get('name')
+                if node_name:
+                    # Simple node name shortening
+                    import re
+                    # Extract meaningful part + number
+                    match = re.search(r'([a-z]+).*?(\d+)', node_name, re.IGNORECASE)
+                    if match:
+                        short_name = f"{match.group(1)}-{match.group(2)}"
+                    else:
+                        short_name = node_name[:10]  # Fallback truncation
+
+                    node_counts[short_name] = node_counts.get(short_name, 0) + 1
+                    successful_samples += 1
+        except Exception:
+            pass  # Ignore failed samples
+
+    logger.info(f"Load balancer sampling complete: {successful_samples}/{samples} successful")
+
+    if node_counts:
+        actual_nodes = len(node_counts)
+        summary = ', '.join([f"{node}={count}" for node, count in sorted(node_counts.items())])
+        logger.info(f"Expected nodes: {expected_nodes}, Actual nodes seen: {actual_nodes}")
+        logger.info(f"Load balancer distribution: {summary}")
+    
+        if actual_nodes != expected_nodes:
+            logger.warning(f"Node count mismatch! Expected {expected_nodes} but saw {actual_nodes} nodes")
+    
+    return node_counts
+
+
 def create_table(client: CrateDBClient, table_name: str, num_objects: int = 0) -> None:
     """Create the target table in CrateDB."""
 
@@ -257,7 +475,8 @@ def create_table(client: CrateDBClient, table_name: str, num_objects: int = 0) -
 
 def worker_thread(worker_id: int, connection_string: str, table_name: str,
                  insert_sql: str, batch_size: int, batch_interval: float,
-                 monitor: PerformanceMonitor, stop_event: threading.Event, num_objects: int = 0):
+                 monitor: PerformanceMonitor, stop_event: threading.Event, num_objects: int = 0,
+                 lb_distribution: Dict[str, int] = None):
     """Worker thread that generates and inserts records."""
     thread_logger = logger.bind(worker=worker_id)
     thread_logger.info(f"Worker {worker_id} starting...")
@@ -266,6 +485,8 @@ def worker_thread(worker_id: int, connection_string: str, table_name: str,
         # Each worker gets its own client and generator
         client = CrateDBClient(connection_string)
         generator = RecordGenerator(num_objects)
+
+        thread_logger.info(f"Worker {worker_id} connected - load balancer distribution determined at startup")
 
         while not stop_event.is_set():
             try:
@@ -396,6 +617,9 @@ def cli(table_name: str, connection_string: Optional[str], duration: int,
         client = CrateDBClient(connection_string)
         monitor = PerformanceMonitor()
 
+        # Sample load balancer distribution first (using 5-tuple test)
+        lb_distribution = sample_load_balancer_5tuple(connection_string)
+
         # Create table
         create_table(client, table_name, objects)
 
@@ -431,7 +655,7 @@ def cli(table_name: str, connection_string: Optional[str], duration: int,
             worker = threading.Thread(
                 target=worker_thread,
                 args=(i, connection_string, table_name, insert_sql,
-                      batch_size, batch_interval, monitor, stop_event, objects),
+                      batch_size, batch_interval, monitor, stop_event, objects, lb_distribution),
                 daemon=True
             )
             workers.append(worker)
@@ -476,6 +700,17 @@ def cli(table_name: str, connection_string: Optional[str], duration: int,
         if final_stats['errors'] > 0:
             error_rate = (final_stats['errors'] / final_stats['total_batches']) * 100
             logger.warning(f"Error rate: {error_rate:.2f}%")
+
+        # Load balancer distribution summary
+        if lb_distribution:
+            logger.info("Load Balancer Distribution:")
+            node_summary = []
+            total_samples = sum(lb_distribution.values())
+            for node, count in sorted(lb_distribution.items()):
+                percentage = (count / total_samples) * 100 if total_samples > 0 else 0
+                node_summary.append(f"{node}={count} ({percentage:.1f}%)")
+            logger.success(f"Distribution: {', '.join(node_summary)}")
+            logger.info("(Based on 5-tuple HTTP connection test - actual SQL connections may behave differently)")
 
         logger.info("=" * 60)
 
