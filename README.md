@@ -11,6 +11,7 @@ A Python script for generating and inserting random records into CrateDB with pe
 - **CLI Interface**: Easy-to-use command-line interface with Click
 - **Environment Configuration**: Connection strings via `.env` file
 - **Structured Logging**: Beautiful logs with Loguru
+- **Load Balancer Testing**: Built-in 5-tuple load balancer distribution analysis
 - **Error Handling**: Robust error handling with retry logic
 
 ## Installation
@@ -195,6 +196,48 @@ Total errors: 0
 2024-01-15 10:30:10 | INFO     | Performance: 750.3 records/sec (current), 750.3 records/sec (avg), Total: 7,503 records, Batches: 75, Threads: 1, Errors: 0
 ...
 ```
+
+## Load Balancer Testing
+
+The script automatically performs a 5-tuple load balancer test at startup to verify proper distribution across CrateDB cluster nodes.
+
+### 5-Tuple Test Details
+
+Before starting the main workload, the script:
+
+1. **Creates 30 fresh TCP connections** to the CrateDB cluster
+2. **Uses different source ports** for each connection (5-tuple hashing)
+3. **Measures distribution** across available nodes
+4. **Displays visual summary** of load balancer behavior
+
+### Example Output
+
+```
+🔍 5-TUPLE LOAD BALANCER TEST
+============================================================
+Target: your-cluster.cratedb.net:4200 (HTTPS)
+Requests: 30 (each with fresh TCP connection)
+
+📈 NODE DISTRIBUTION:
+   data-hot-0      |  10 hits |  33.3% | ████████████████
+   data-hot-1      |   7 hits |  23.3% | ███████████
+   data-hot-2      |  13 hits |  43.3% | █████████████████████
+
+✅ Load balancer IS distributing across nodes
+Evidence: 30 source ports hit 3 different nodes
+```
+
+### What This Means
+
+- **✅ Optimal Distribution**: Each worker thread will connect to a different node at startup
+- **🔄 Persistent Connections**: After initial distribution, each thread reuses its connection efficiently
+- **📊 Performance Confidence**: You can trust that multi-threaded tests will utilize all cluster nodes
+
+### Interpreting Results
+
+- **Multiple nodes hit**: Load balancer is working correctly
+- **Single node hit**: May indicate load balancer misconfiguration or single healthy node
+- **Uneven distribution**: Normal due to hash distribution; becomes more even with more connections
 
 ## Development
 
