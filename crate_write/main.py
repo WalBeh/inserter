@@ -11,7 +11,7 @@ import sys
 import time
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import random
 import json
 
@@ -22,6 +22,17 @@ from faker import Faker
 import requests
 from requests.auth import HTTPBasicAuth
 from urllib.parse import urlparse
+
+
+def sanitize_connection_string(connection_string: str) -> str:
+    """Remove credentials from connection string for safe logging."""
+    try:
+        parsed = urlparse(connection_string)
+        # Reconstruct URL without credentials
+        sanitized = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 4200}"
+        return sanitized
+    except Exception:
+        return "invalid-connection-string"
 
 
 class CrateDBClient:
@@ -37,9 +48,9 @@ class CrateDBClient:
 
             # Validate required components
             if not parsed.scheme:
-                raise ValueError(f"Missing scheme in connection string: {connection_string}")
+                raise ValueError(f"Missing scheme in connection string: {sanitize_connection_string(connection_string)}")
             if not parsed.hostname:
-                raise ValueError(f"Missing hostname in connection string: {connection_string}")
+                raise ValueError(f"Missing hostname in connection string: {sanitize_connection_string(connection_string)}")
 
             self.base_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 4200}"
             self.auth = None
@@ -47,10 +58,10 @@ class CrateDBClient:
             if parsed.username and parsed.password:
                 self.auth = HTTPBasicAuth(parsed.username, parsed.password)
 
-            logger.info(f"Connecting to CrateDB at: {parsed.scheme}://{parsed.hostname}:{parsed.port or 4200}")
+            logger.info(f"Connecting to CrateDB at: {sanitize_connection_string(connection_string)}")
 
         except Exception as e:
-            logger.error(f"Failed to parse connection string '{connection_string}': {e}")
+            logger.error(f"Failed to parse connection string '{sanitize_connection_string(connection_string)}': {e}")
             raise ValueError(f"Invalid connection string format: {e}")
 
         self.session = requests.Session()
@@ -212,23 +223,375 @@ class RecordGenerator:
         return [self.generate_record() for _ in range(batch_size)]
 
 
+def make_fresh_request(connection_string: str) -> Tuple[Dict, str, int, Dict]:
+    """
+    Make a single HTTP request with a fresh TCP connection.
+    Returns: (response_data, node_name, source_port, connection_info)
+    """
+    import socket
+    import ssl
+    import json
+    import base64
+
+    parsed = urlparse(connection_string)
+    if not parsed.hostname:
+        raise ValueError("Invalid connection string - missing hostname")
+
+    host = parsed.hostname
+    port = parsed.port or 4200
+    use_ssl = parsed.scheme == 'https'
+
+    # Prepare authentication header if needed
+    auth_header = None
+    if parsed.username and parsed.password:
+        credentials = f"{parsed.username}:{parsed.password}"
+        encoded = base64.b64encode(credentials.encode()).decode()
+        auth_header = f"Basic {encoded}"
+
+    sock = None
+    try:
+        # Create a fresh TCP socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
+
+        # Connect to the server
+        start_connect = time.time()
+        sock.connect((host, port))
+        connect_time = time.time() - start_connect
+
+        # Get local address (source IP and port)
+        source_ip, source_port = sock.getsockname()
+        dest_ip, dest_port = sock.getpeername()
+
+        # Wrap with SSL if needed
+        if use_ssl:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            sock = context.wrap_socket(sock, server_hostname=host)
+
+        # Prepare HTTP request
+        http_request = f"GET / HTTP/1.1\r\n"
+        http_request += f"Host: {host}:{port}\r\n"
+        http_request += "Connection: close\r\n"  # Force connection close
+        http_request += "User-Agent: CrateDB-5Tuple-Tester/1.0\r\n"
+
+        if auth_header:
+            http_request += f"Authorization: {auth_header}\r\n"
+
+        http_request += "\r\n"
+
+        # Send request
+        start_request = time.time()
+        sock.sendall(http_request.encode())
+
+        # Read response
+        response_data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response_data += chunk
+
+        request_time = time.time() - start_request
+
+        # Parse HTTP response
+        response_text = response_data.decode('utf-8', errors='ignore')
+        headers, body = response_text.split('\r\n\r\n', 1)
+
+        # Extract JSON from body
+        try:
+            json_data = json.loads(body)
+            node_name = json_data.get('name', 'unknown')
+        except:
+            node_name = 'parse_error'
+
+        connection_info = {
+            'source_ip': source_ip,
+            'source_port': source_port,
+            'dest_ip': dest_ip,
+            'dest_port': dest_port,
+            'connect_time_ms': connect_time * 1000,
+            'request_time_ms': request_time * 1000,
+            'total_time_ms': (connect_time + request_time) * 1000
+        }
+
+        return json_data, node_name, source_port, connection_info
+
+    except Exception as e:
+        return {}, f"error: {e}", 0, {}
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except:
+                pass
+
+
+def test_5tuple_distribution_comprehensive(connection_string: str, num_requests: int = None) -> Dict:
+    """
+    Test load balancer distribution using fresh connections with comprehensive analysis.
+    Each request will have a different source port, allowing proper 5-tuple load balancing testing.
+    """
+    parsed = urlparse(connection_string)
+    host = parsed.hostname
+    port = parsed.port or 4200
+    use_ssl = parsed.scheme == 'https'
+    base_url = f"{parsed.scheme}://{host}:{port}"
+
+    print(f"🔍 5-TUPLE LOAD BALANCER TEST")
+    print("=" * 60)
+    print(f"Target: {host}:{port} ({'HTTPS' if use_ssl else 'HTTP'})")
+    
+    # Query sys.nodes to determine cluster size
+    expected_nodes = 1  # Default fallback
+    try:
+        print("📋 Querying sys.nodes to determine cluster size...")
+        
+        # Create session for sys.nodes query
+        session = requests.Session()
+        if parsed.username and parsed.password:
+            session.auth = HTTPBasicAuth(parsed.username, parsed.password)
+        
+        payload = {"stmt": "SELECT count(*) as node_count FROM sys.nodes"}
+        response = session.post(
+            f"{base_url}/_sql",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('rows') and len(data['rows']) > 0:
+                expected_nodes = data['rows'][0][0]
+                print(f"✅ Cluster has {expected_nodes} node(s)")
+        else:
+            print(f"⚠️  Failed to query sys.nodes: HTTP {response.status_code}")
+            print(f"   Using default assumption of 1 node")
+    except Exception as e:
+        print(f"⚠️  Could not determine cluster size: {e}")
+        print(f"   Using default assumption of 1 node")
+    
+    # Calculate test requests: 30 per node, minimum 30
+    if num_requests is None:
+        num_requests = max(30, expected_nodes * 30)
+    
+    print(f"📊 Test plan: {num_requests} requests ({num_requests//expected_nodes} per expected node)")
+    print(f"Requests: {num_requests} (each with fresh TCP connection)")
+    print()
+
+    results = []
+    node_counts = {}
+    source_ports = []
+    failed_requests = 0
+
+    print("📊 Request Details:")
+    print("Req# |    Node    | SrcPort | ConnTime | ReqTime | TotalTime")
+    print("-" * 65)
+
+    for i in range(num_requests):
+        try:
+            json_data, node_name, source_port, conn_info = make_fresh_request(connection_string)
+
+            if node_name.startswith('error:'):
+                failed_requests += 1
+                print(f"{i+1:4d} | {'ERROR':10} | {'N/A':7} | {'N/A':8} | {'N/A':7} | {node_name}")
+                continue
+
+            # Track results
+            results.append({
+                'request_num': i + 1,
+                'node_name': node_name,
+                'source_port': source_port,
+                'connection_info': conn_info
+            })
+
+            node_counts[node_name] = node_counts.get(node_name, 0) + 1
+            source_ports.append(source_port)
+
+            # Print request details
+            conn_time = conn_info.get('connect_time_ms', 0)
+            req_time = conn_info.get('request_time_ms', 0)
+            total_time = conn_info.get('total_time_ms', 0)
+
+            print(f"{i+1:4d} | {node_name:10} | {source_port:7d} | {conn_time:6.1f}ms | {req_time:5.1f}ms | {total_time:7.1f}ms")
+
+            # Small delay to ensure different source ports
+            time.sleep(0.1)
+
+        except KeyboardInterrupt:
+            print(f"\n⚠️  Test interrupted by user")
+            break
+        except Exception as e:
+            failed_requests += 1
+            print(f"{i+1:4d} | {'ERROR':10} | {'N/A':7} | {'N/A':8} | {'N/A':7} | {e}")
+
+    print("-" * 65)
+
+    # Analyze results
+    successful_requests = len(results)
+    unique_ports = len(set(source_ports)) if source_ports else 0
+    unique_nodes = len(node_counts)
+
+    print(f"\n📊 SUMMARY:")
+    print(f"   Total requests: {num_requests}")
+    print(f"   Successful: {successful_requests}")
+    print(f"   Failed: {failed_requests}")
+    print(f"   Unique source ports: {unique_ports}")
+    print(f"   Unique nodes hit: {unique_nodes}")
+
+    if successful_requests > 0:
+        avg_times = {
+            'connect': sum(r['connection_info'].get('connect_time_ms', 0) for r in results) / successful_requests,
+            'request': sum(r['connection_info'].get('request_time_ms', 0) for r in results) / successful_requests,
+            'total': sum(r['connection_info'].get('total_time_ms', 0) for r in results) / successful_requests
+        }
+        print(f"   Avg connect time: {avg_times['connect']:.1f}ms")
+        print(f"   Avg request time: {avg_times['request']:.1f}ms")
+        print(f"   Avg total time: {avg_times['total']:.1f}ms")
+
+    # Distribution analysis
+    print(f"\n📈 NODE DISTRIBUTION:")
+    if node_counts:
+        for node_name, count in sorted(node_counts.items()):
+            percentage = (count / successful_requests) * 100
+            bar = "█" * int(percentage / 2)
+            print(f"   {node_name:15} | {count:3d} hits | {percentage:5.1f}% | {bar}")
+
+# 5-tuple analysis
+    print(f"\n🔍 5-TUPLE LOAD BALANCING ANALYSIS:")
+
+    if unique_ports < 2:
+        print("   ❌ INCONCLUSIVE: Need more unique source ports to test")
+        print("   💡 Try increasing request count or reducing delay")
+    else:
+        print(f"   ✅ Good test conditions: {unique_ports} different source ports")
+
+        if unique_nodes == 1:
+            print("   🚨 VERDICT: Load balancer NOT using 5-tuple distribution")
+            print(f"   📝 Evidence: {unique_ports} different source ports, but all hit same node")
+            print("   🔧 All requests had different 5-tuples but same destination")
+            print("   💭 Possible causes:")
+            print("      - Load balancer using different algorithm (round-robin, least-conn)")
+            print("      - Sticky sessions based on client IP")
+            print("      - Only one healthy backend node")
+            print("      - Load balancer misconfiguration")
+
+        elif unique_nodes > 1:
+            print("   ✅ VERDICT: Load balancer IS distributing across nodes")
+            print(f"   📝 Evidence: {unique_ports} source ports hit {unique_nodes} different nodes")
+
+            # Check if distribution correlates with source port
+            port_to_node = {}
+            for result in results:
+                port = result['source_port']
+                node = result['node_name']
+                port_to_node[port] = node
+
+            # Simple test: check if similar ports tend to hit same nodes
+            sorted_ports = sorted(port_to_node.items())
+            print("   🔍 Port-to-Node mapping (first 10):")
+            for port, node in sorted_ports[:10]:
+                print(f"      Port {port} → {node}")
+
+            # Check for patterns
+            if len(set(port_to_node.values())) == len(port_to_node):
+                print("   📊 Pattern: Each port hits a different node (possible 5-tuple)")
+            else:
+                print("   📊 Pattern: Some ports hit same nodes (possible hash collision)")
+
+    # Port range analysis
+    if source_ports:
+        port_range = max(source_ports) - min(source_ports)
+        print(f"\n📡 SOURCE PORT ANALYSIS:")
+        print(f"   Port range: {min(source_ports)} - {max(source_ports)} (span: {port_range})")
+        print(f"   Port utilization: {unique_ports}/{port_range+1} ports used")
+
+        if port_range > 100:
+            print("   ✅ Good port diversity for 5-tuple testing")
+        else:
+            print("   ⚠️  Limited port range - may affect 5-tuple hash distribution")
+
+    print("\n" + "=" * 60)
+    print("🎯 FINAL VERDICT")
+    print("=" * 60)
+    
+    print(f"📊 CLUSTER ANALYSIS:")
+    print(f"   Expected nodes: {expected_nodes}")
+    print(f"   Nodes hit during test: {unique_nodes}")
+    
+    if unique_nodes == expected_nodes:
+        print(f"   ✅ Perfect distribution - hit all {expected_nodes} nodes")
+    elif unique_nodes < expected_nodes:
+        print(f"   ⚠️  Partial distribution - hit {unique_nodes}/{expected_nodes} nodes")
+        print(f"   💭 Possible causes: hash distribution, unhealthy nodes, or more requests needed")
+    else:
+        print(f"   🤔 Unexpected - hit more nodes ({unique_nodes}) than expected ({expected_nodes})")
+
+    if unique_nodes == 1 and unique_ports > 5:
+        print("\n🚨 CONFIRMED: Load balancer NOT using 5-tuple distribution")
+        print("📋 Evidence:")
+        print(f"   • {unique_ports} different source ports")
+        print(f"   • All requests hit the same node")
+        print(f"   • Each request had unique 5-tuple values")
+        print("\n💡 This explains why simple tests might show single-node routing!")
+        print("   Even with connection pooling disabled, traffic goes to one node.")
+
+    elif unique_nodes > 1:
+        print("\n✅ Load balancer IS distributing traffic across nodes")
+        print("📋 Evidence:")
+        print(f"   • {unique_ports} different source ports")
+        print(f"   • Traffic distributed across {unique_nodes} nodes")
+
+    else:
+        print("\n❓ Inconclusive results - need more data")
+
+    print(f"\n🔧 Recommendation for your load testing:")
+    if unique_nodes == 1:
+        print("   • Contact CrateDB Cloud support about load balancer config")
+        print("   • Performance tests will only stress one node")
+        print("   • Consider using multiple client IPs if possible")
+    elif unique_nodes == expected_nodes:
+        print("   • Load balancer is working optimally")
+        print("   • Performance tests will distribute perfectly across all nodes")
+        print("   • Multiple worker threads will utilize different nodes")
+    else:
+        print("   • Load balancer appears to be working correctly")
+        print("   • Performance tests should distribute across nodes")
+        print("   • Multiple worker threads will utilize different nodes")
+        if unique_nodes < expected_nodes:
+            print(f"   • Consider running more requests to hit all {expected_nodes} nodes")
+
+    return {
+        'total_requests': num_requests,
+        'successful_requests': successful_requests,
+        'failed_requests': failed_requests,
+        'unique_ports': unique_ports,
+        'unique_nodes': unique_nodes,
+        'expected_nodes': expected_nodes,
+        'node_distribution': node_counts,
+        'results': results
+    }
+
+
 def sample_load_balancer_5tuple(connection_string: str, samples: int = None) -> Dict[str, int]:
     """Sample load balancer distribution using fresh TCP connections (5-tuple test)."""
     import socket
     import ssl
     import json
     import base64
-    
+
     logger.info("Starting 5-tuple load balancer analysis...")
 
     parsed = urlparse(connection_string)
     if not parsed.hostname:
         raise ValueError("Invalid connection string - missing hostname")
-        
+
     host = parsed.hostname
     port = parsed.port or 4200
     use_ssl = parsed.scheme == 'https'
-    
+
     # Prepare authentication header if needed
     auth_header = None
     if parsed.username and parsed.password:
@@ -239,7 +602,7 @@ def sample_load_balancer_5tuple(connection_string: str, samples: int = None) -> 
     # Calculate samples
     if samples is None:
         samples = 30
-    
+
     logger.info(f"Testing load balancer with {samples} fresh TCP connections...")
 
     node_counts = {}
@@ -247,90 +610,32 @@ def sample_load_balancer_5tuple(connection_string: str, samples: int = None) -> 
     source_ports = []
 
     for i in range(samples):
-        sock = None
-        try:
-            # Create a fresh TCP socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            
-            # Connect to the server
-            sock.connect((host, port))
-            
-            # Get source port for 5-tuple analysis
-            source_ip, source_port = sock.getsockname()
+        json_data, node_name, source_port, conn_info = make_fresh_request(connection_string)
+
+        if not node_name.startswith('error:'):
+            # Simple node name shortening
+            import re
+            match = re.search(r'([a-z]+).*?(\d+)', node_name, re.IGNORECASE)
+            if match:
+                short_name = f"{match.group(1)}-{match.group(2)}"
+            else:
+                short_name = node_name[:10]
+
+            node_counts[short_name] = node_counts.get(short_name, 0) + 1
+            successful_samples += 1
             source_ports.append(source_port)
-            
-            # Wrap with SSL if needed
-            if use_ssl:
-                context = ssl.create_default_context()
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                sock = context.wrap_socket(sock, server_hostname=host)
-            
-            # Prepare HTTP request
-            http_request = f"GET / HTTP/1.1\r\n"
-            http_request += f"Host: {host}:{port}\r\n"
-            http_request += "Connection: close\r\n"
-            http_request += "User-Agent: CrateDB-5Tuple-Tester/1.0\r\n"
-            
-            if auth_header:
-                http_request += f"Authorization: {auth_header}\r\n"
-            
-            http_request += "\r\n"
-            
-            # Send request and read response
-            sock.sendall(http_request.encode())
-            
-            response_data = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                response_data += chunk
-            
-            # Parse HTTP response
-            response_text = response_data.decode('utf-8', errors='ignore')
-            headers, body = response_text.split('\r\n\r\n', 1)
-            
-            # Extract JSON from body
-            try:
-                json_data = json.loads(body)
-                node_name = json_data.get('name', 'unknown')
-                
-                # Simple node name shortening
-                import re
-                match = re.search(r'([a-z]+).*?(\d+)', node_name, re.IGNORECASE)
-                if match:
-                    short_name = f"{match.group(1)}-{match.group(2)}"
-                else:
-                    short_name = node_name[:10]
-                
-                node_counts[short_name] = node_counts.get(short_name, 0) + 1
-                successful_samples += 1
-                
-            except Exception:
-                pass  # Ignore JSON parsing errors
-                
-        except Exception:
-            pass  # Ignore failed connections
-        finally:
-            if sock:
-                try:
-                    sock.close()
-                except:
-                    pass
-        
+
         # Small delay to ensure different source ports
         time.sleep(0.05)
 
     logger.info(f"5-tuple test complete: {successful_samples}/{samples} successful")
-    
+
     if node_counts:
         unique_ports = len(set(source_ports))
         unique_nodes = len(node_counts)
-        
+
         logger.info(f"Unique source ports: {unique_ports}, Unique nodes hit: {unique_nodes}")
-        
+
         # Display visual distribution
         print("\n📈 NODE DISTRIBUTION:")
         for node_name, count in sorted(node_counts.items()):
@@ -338,7 +643,7 @@ def sample_load_balancer_5tuple(connection_string: str, samples: int = None) -> 
             bar_length = int(percentage / 2)  # Scale bar to reasonable length
             bar = "█" * bar_length
             print(f"   {node_name:15} | {count:3d} hits | {percentage:5.1f}% | {bar}")
-        
+
         # Analysis
         if unique_nodes == 1 and unique_ports > 5:
             logger.warning("⚠️  Load balancer may NOT be using 5-tuple distribution")
@@ -348,7 +653,7 @@ def sample_load_balancer_5tuple(connection_string: str, samples: int = None) -> 
             logger.info(f"Evidence: {unique_ports} source ports hit {unique_nodes} different nodes")
         else:
             logger.info("❓ Inconclusive results - need more data")
-    
+
     return node_counts
 
 
@@ -423,10 +728,10 @@ def sample_load_balancer(connection_string: str, samples: int = None) -> Dict[st
         summary = ', '.join([f"{node}={count}" for node, count in sorted(node_counts.items())])
         logger.info(f"Expected nodes: {expected_nodes}, Actual nodes seen: {actual_nodes}")
         logger.info(f"Load balancer distribution: {summary}")
-    
+
         if actual_nodes != expected_nodes:
             logger.warning(f"Node count mismatch! Expected {expected_nodes} but saw {actual_nodes} nodes")
-    
+
     return node_counts
 
 
@@ -539,8 +844,8 @@ def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event, nu
 @click.command()
 @click.option(
     "--table-name",
-    required=True,
-    help="Name of the CrateDB table to insert records into"
+    required=False,
+    help="Name of the CrateDB table to insert records into (required unless --test-loadbalancer)"
 )
 @click.option(
     "--connection-string",
@@ -549,8 +854,8 @@ def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event, nu
 @click.option(
     "--duration",
     type=int,
-    required=True,
-    help="Duration to run the generator (in minutes)"
+    required=False,
+    help="Duration to run the generator (in minutes) (required unless --test-loadbalancer)"
 )
 @click.option(
     "--batch-size",
@@ -576,13 +881,20 @@ def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event, nu
     default=0,
     help="Number of additional low-cardinality object columns to create (default: 0)"
 )
-def cli(table_name: str, connection_string: Optional[str], duration: int,
-        batch_size: int, batch_interval: float, threads: int, objects: int):
+@click.option(
+    "--test-loadbalancer",
+    is_flag=True,
+    help="Run only the 5-tuple load balancer test (no table creation or data insertion)"
+)
+def cli(table_name: Optional[str], connection_string: Optional[str], duration: Optional[int],
+        batch_size: int, batch_interval: float, threads: int, objects: int, test_loadbalancer: bool):
     """
     Generate and insert random records into CrateDB for testing purposes.
 
     This script generates realistic test data and inserts it into a CrateDB table
     with performance monitoring and reporting.
+
+    Use --test-loadbalancer to run only the load balancer distribution test.
     """
     # Load environment variables
     load_dotenv()
@@ -603,7 +915,34 @@ def cli(table_name: str, connection_string: Optional[str], duration: int,
             logger.error("Connection string not provided via --connection-string or CRATE_CONNECTION_STRING env var")
             sys.exit(1)
 
+    # Handle load balancer test mode
+    if test_loadbalancer:
+        logger.info("🚀 CrateDB 5-Tuple Load Balancer Test")
+        logger.info("=" * 60)
+        logger.info("This test creates fresh TCP connections to properly test")
+        logger.info("whether load balancers use 5-tuple hashing for distribution.")
+        logger.info("")
+        logger.info(f"🔗 Connection: {sanitize_connection_string(connection_string)}")
+        logger.info("")
+
+        try:
+            results = test_5tuple_distribution_comprehensive(connection_string)
+            logger.info("✅ Load balancer test completed successfully")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"❌ Load balancer test failed: {e}")
+            sys.exit(1)
+
+    # Validate required arguments for data generation mode
+    if not table_name:
+        logger.error("--table-name is required when not using --test-loadbalancer")
+        sys.exit(1)
+    if duration is None:
+        logger.error("--duration is required when not using --test-loadbalancer")
+        sys.exit(1)
+
     logger.info(f"Starting CrateDB record generator")
+    logger.info(f"🔗 Connection: {sanitize_connection_string(connection_string)}")
     logger.info(f"Table: {table_name}")
     logger.info(f"Duration: {duration} minutes")
     logger.info(f"Batch size: {batch_size}")
@@ -710,7 +1049,7 @@ def cli(table_name: str, connection_string: Optional[str], duration: int,
                 percentage = (count / total_samples) * 100 if total_samples > 0 else 0
                 node_summary.append(f"{node}={count} ({percentage:.1f}%)")
             logger.success(f"Distribution: {', '.join(node_summary)}")
-            logger.info("(Based on 5-tuple HTTP connection test - actual SQL connections may behave differently)")
+            logger.info("(Based on 5-tuple HTTP connection test - SQL worker threads distribute similarly at startup)")
 
         logger.info("=" * 60)
 
