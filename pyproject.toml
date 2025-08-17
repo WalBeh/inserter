@@ -7,6 +7,24 @@ name = "crate-write"
 version = "0.1.0"
 description = "A Python script for generating and inserting records into CrateDB"
 authors = [{ name = "Your Name", email = "your.email@example.com" }]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/your-org/crate-write"
+repository = "https://github.com/your-org/crate-write"
+keywords = ["cratedb", "database", "testing", "performance", "data-generation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Testing",
+]
 dependencies = [
     "click>=8.1.0",
     "loguru>=0.7.0",

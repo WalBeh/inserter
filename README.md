@@ -1,5 +1,25 @@
 # CrateDB Record Generator
 
+High-performance record generators for CrateDB with comprehensive monitoring and testing capabilities. Available in both Python and Rust implementations.
+
+## 🚀 Implementation Options
+
+### Python Implementation (Default)
+- **Feature-complete** with load balancer testing
+- **Easy setup** with familiar Python tooling
+- **Moderate performance** (~1,000-5,000 records/sec)
+- **Perfect for** development, testing, and moderate workloads
+
+### Rust Implementation (High Performance)
+- **Maximum performance** (10,000-20,000+ records/sec)
+- **Low resource usage** and true concurrency
+- **Production-ready** for extreme workloads
+- **Perfect for** stress testing and high-throughput scenarios
+
+---
+
+## Python Implementation
+
 A Python script for generating and inserting random records into CrateDB with performance monitoring and reporting.
 
 ## Features
@@ -302,6 +322,129 @@ For long-running sessions:
 1. Monitor memory usage of both the script and CrateDB
 2. Consider reducing batch size if memory usage is high
 3. Ensure adequate swap space is available
+
+---
+
+## 🦀 Rust Implementation (High Performance)
+
+For maximum performance and production workloads, use the Rust implementation located in the `rust/` directory.
+
+### Quick Start (Rust)
+
+#### Prerequisites
+- [Rust 1.70+](https://rustup.rs/) installed
+- CrateDB connection details
+
+#### Setup & Build
+```bash
+# Navigate to Rust implementation
+cd rust
+
+# Build optimized release binary (one-time setup)
+cargo build --release
+
+# Set up environment variables
+cp ../.env .env  # Copy from parent directory
+# Or create new .env with your connection string:
+echo "CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200" > .env
+```
+
+#### Usage
+```bash
+# Basic usage (reads connection from .env file)
+./target/release/crate-write --table-name rust_test --duration 5
+
+# High-performance stress test
+./target/release/crate-write \
+    --table-name stress_test \
+    --duration 2 \
+    --threads 32 \
+    --batch-size 6000 \
+    --batch-interval 0
+
+# Wide table testing
+./target/release/crate-write \
+    --table-name wide_test \
+    --duration 3 \
+    --objects 200 \
+    --threads 8
+```
+
+### Performance Comparison
+
+| Implementation | Typical Performance | Max Threads | Memory Usage | Setup Complexity |
+|----------------|-------------------|-------------|--------------|------------------|
+| **Python** | 1,000-5,000 rec/sec | 8-16 | ~50-200MB | Easy |
+| **Rust** | 10,000-20,000+ rec/sec | 32+ | ~5-50MB | Medium |
+
+### Rust-Specific Features
+
+- **True Concurrency**: No GIL limitations, uses all CPU cores effectively
+- **Memory Efficient**: 10x lower memory usage than Python
+- **Zero Copy**: Optimized data handling for maximum throughput
+- **Production Ready**: Comprehensive error handling and logging
+- **Single Binary**: No runtime dependencies after compilation
+
+### Command Line Options (Rust)
+
+All Python options are supported with identical syntax:
+
+```bash
+./target/release/crate-write \
+    --table-name <TABLE_NAME> \
+    --duration <MINUTES> \
+    [--connection-string <URL>] \
+    [--batch-size <SIZE>] \
+    [--batch-interval <MS>] \
+    [--threads <COUNT>] \
+    [--objects <COUNT>] \
+    [--log-level <LEVEL>]
+```
+
+### Environment Configuration (Rust)
+
+Create `rust/.env` file:
+```env
+# Required: CrateDB connection string
+CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200
+
+# Optional: Logging level
+LOG_LEVEL=info
+```
+
+### Example Output (Rust)
+
+```
+🚀 CrateDB Record Generator (Rust)
+Connection: https://your-cluster:4200
+✅ Table 'stress_test' created successfully
+Starting 32 worker tasks...
+Performance: 18,186.2 records/sec (avg), Total: 2,196,000 records, Threads: 32, Errors: 0
+✅ Average insertion rate: 18,186.2 records/second
+```
+
+### When to Use Rust Implementation
+
+**Choose Rust for:**
+- ✅ **Stress testing** (>10,000 records/sec)
+- ✅ **Production workloads** with high throughput requirements
+- ✅ **Resource-constrained environments** (limited memory/CPU)
+- ✅ **Long-running tests** (hours/days of continuous insertion)
+- ✅ **Wide table testing** (hundreds of columns)
+
+**Choose Python for:**
+- ✅ **Development and prototyping**
+- ✅ **Load balancer analysis** (5-tuple testing)
+- ✅ **Moderate workloads** (<5,000 records/sec)
+- ✅ **Quick setup** and familiar tooling
+
+### Documentation
+
+- **Detailed Rust documentation**: See `README-rust.md`
+- **Performance analysis**: See `THREADING_ANALYSIS.md`
+- **Configuration guide**: See `BATCH_INTERVAL_GUIDE.md`
+
+---
 
 ## License
 
