@@ -51,6 +51,10 @@ url = "2.0"
 # Base64 encoding for auth
 base64 = "0.21"
 
+# TLS for raw socket load balancer test
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+
 
 # TOML parsing for config files
 toml = "0.8"
@@ -67,6 +71,9 @@ metrics-exporter-prometheus = { version = "0.12", optional = true }
 default = ["dashboard"]
 dashboard = ["crossterm", "ratatui"]
 prometheus = ["metrics-exporter-prometheus"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = true
