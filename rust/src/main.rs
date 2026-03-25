@@ -41,20 +41,20 @@ struct Cli {
     duration: Option<u64>,
 
     /// Number of records to insert in each batch
-    #[arg(long, default_value = "100")]
-    batch_size: usize,
+    #[arg(long)]
+    batch_size: Option<usize>,
 
     /// Interval between batches in milliseconds
-    #[arg(long, default_value = "100")]
-    batch_interval: u64,
+    #[arg(long)]
+    batch_interval: Option<u64>,
 
     /// Number of parallel worker tasks
-    #[arg(long, default_value = "1")]
-    threads: usize,
+    #[arg(long)]
+    threads: Option<usize>,
 
     /// Number of additional low-cardinality object columns to create
-    #[arg(long, default_value = "0")]
-    objects: usize,
+    #[arg(long)]
+    objects: Option<usize>,
 
     /// Enable real-time dashboard (not implemented yet)
     #[arg(long)]
@@ -668,10 +668,18 @@ async fn main() -> Result<()> {
     if let Some(duration) = cli.duration {
         config.duration = Some(duration);
     }
-    config.batch_size = cli.batch_size;
-    config.batch_interval = cli.batch_interval;
-    config.threads = cli.threads;
-    config.objects = cli.objects;
+    if let Some(batch_size) = cli.batch_size {
+        config.batch_size = batch_size;
+    }
+    if let Some(batch_interval) = cli.batch_interval {
+        config.batch_interval = batch_interval;
+    }
+    if let Some(threads) = cli.threads {
+        config.threads = threads;
+    }
+    if let Some(objects) = cli.objects {
+        config.objects = objects;
+    }
 
     // Validate configuration
     config.validate()?;
