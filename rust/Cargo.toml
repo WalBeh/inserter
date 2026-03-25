@@ -51,6 +51,9 @@ url = "2.0"
 # Base64 encoding for auth
 base64 = "0.21"
 
+# Gzip compression for bulk inserts
+flate2 = "1.0"
+
 # TLS for raw socket load balancer test
 native-tls = "0.2"
 tokio-native-tls = "0.3"

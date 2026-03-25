@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Write;
 
 use tracing::{debug, error};
 use url::Url;
@@ -129,7 +132,7 @@ impl CrateClient {
         self.make_request(&request).await.map(|_| ())
     }
 
-    /// Accept owned bulk_args to avoid copying the entire payload
+    /// Accept owned bulk_args, gzip-compress, and send to CrateDB
     pub async fn execute_bulk(&self, sql: &str, bulk_args: Vec<Vec<Value>>) -> Result<()> {
         if bulk_args.is_empty() {
             return Ok(());
@@ -138,19 +141,51 @@ impl CrateClient {
         let request = SqlRequest {
             stmt: sql.to_string(),
             args: None,
-            bulk_args: Some(bulk_args), // moved, not copied
+            bulk_args: Some(bulk_args),
         };
 
-        match self.make_request(&request).await {
-            Ok(resp) => {
-                debug!("Bulk insert successful: {} records in {:.2}ms",
-                       resp.rowcount, resp.duration);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Bulk insert failed: {}", e);
-                Err(e)
-            }
+        // Serialize to JSON then gzip compress (level 1 = fastest)
+        let json_bytes = serde_json::to_vec(&request)
+            .context("Failed to serialize bulk request")?;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&json_bytes)
+            .context("Failed to gzip compress payload")?;
+        let compressed = encoder.finish()
+            .context("Failed to finish gzip compression")?;
+
+        debug!("Bulk payload: {} bytes JSON -> {} bytes gzip ({:.0}% reduction)",
+               json_bytes.len(), compressed.len(),
+               (1.0 - compressed.len() as f64 / json_bytes.len() as f64) * 100.0);
+
+        let url = format!("{}/_sql", self.base_url);
+        let mut req_builder = self.client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "gzip")
+            .body(compressed);
+
+        if let Some(ref auth) = self.auth_header {
+            req_builder = req_builder.header("Authorization", auth);
+        }
+
+        let response = req_builder
+            .send()
+            .await
+            .with_context(|| format!("Failed to send bulk request to {}", url))?;
+
+        let status = response.status();
+        if status.is_success() {
+            let resp: SqlResponse = response.json().await
+                .context("Failed to parse bulk response")?;
+            debug!("Bulk insert successful: {} records in {:.2}ms",
+                   resp.rowcount, resp.duration);
+            Ok(())
+        } else {
+            let error_text = response.text().await
+                .unwrap_or_else(|_| format!("HTTP {}", status));
+            error!("Bulk insert failed: HTTP {} - {}", status, error_text);
+            anyhow::bail!("Bulk insert failed: HTTP {} - {}", status, error_text);
         }
     }
 
