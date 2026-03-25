@@ -1,84 +1,95 @@
 # CrateDB Record Generator
 
-High-performance record generators for CrateDB with comprehensive monitoring and testing capabilities. Available in both Python and Rust implementations.
+High-performance record generators for CrateDB. Available in Python (async) and Rust, both optimized for maximum insert throughput.
 
-## 🚀 Implementation Options
+## Implementations
 
-### Python Implementation (Default)
-- **Feature-complete** with load balancer testing
-- **Easy setup** with familiar Python tooling
-- **Moderate performance** (~1,000-5,000 records/sec)
-- **Perfect for** development, testing, and moderate workloads
+| | Python (async) | Rust |
+|---|---|---|
+| **Engine** | asyncio + aiohttp | tokio + reqwest |
+| **Concurrency** | Async tasks (no GIL) | Async tasks + thread pool |
+| **Throughput** | ~15,000-17,000 rec/sec | ~15,000-20,000 rec/sec |
+| **Memory** | ~30-100MB | ~5-50MB |
+| **Setup** | `uv run crate-write` | `cargo run` |
 
-### Rust Implementation (High Performance)
-- **Maximum performance** (10,000-20,000+ records/sec)
-- **Low resource usage** and true concurrency
-- **Production-ready** for extreme workloads
-- **Perfect for** stress testing and high-throughput scenarios
+Both implementations share the same CLI interface, table schema, and record format.
 
----
+## Quick Start
 
-## Python Implementation
-
-A Python script for generating and inserting random records into CrateDB with performance monitoring and reporting.
-
-## Features
-
-- **Random Data Generation**: Creates realistic test data with controlled cardinality
-- **Bulk Insertions**: Efficient batch insertions to maximize throughput
-- **Performance Monitoring**: Real-time reporting every 10 seconds
-- **Configurable Duration**: Run for a specified number of minutes
-- **CLI Interface**: Easy-to-use command-line interface with Click
-- **Environment Configuration**: Connection strings via `.env` file
-- **Structured Logging**: Beautiful logs with Loguru
-- **Load Balancer Testing**: Built-in 5-tuple load balancer distribution analysis
-- **Error Handling**: Robust error handling with retry logic
-
-## Installation
-
-This project uses [uv](https://astral.sh/uv) for dependency management. Make sure you have uv installed:
+### Python
 
 ```bash
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# Requires uv (https://astral.sh/uv)
+uv venv && source .venv/bin/activate
+uv pip install -e .
+
+# Configure connection
+echo 'CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200' > .env
+
+# Run (1 minute, 32 async tasks, batch size 1000, no delay)
+uv run crate-write --table-name test_events --duration 1 --threads 32 --batch-size 1000 --batch-interval 0
 ```
 
-Clone and set up the project:
+### Rust
 
 ```bash
-git clone <repository-url>
-cd crate-write
+cd rust
 
-# Create virtual environment and install dependencies
-uv venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-uv pip install -e .
+# Configure connection
+echo 'CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200' > .env
+
+# Run (reads config.toml: 32 threads, batch_size 1000, batch_interval 0)
+cargo run
 ```
 
 ## Configuration
 
-Copy the example `.env` file and configure your CrateDB connection:
+### Environment Variables
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env` to set your CrateDB connection string:
+Create a `.env` file in the project root (Python) or `rust/` directory (Rust):
 
 ```env
-# CrateDB connection string
-CRATE_CONNECTION_STRING=http://admin:password@localhost:4200
-
-# Optional: Set log level
+CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200
 LOG_LEVEL=INFO
+```
+
+### Rust Config File
+
+The Rust implementation auto-detects `rust/config.toml`:
+
+```toml
+table_name = "performance_test"
+duration = 10
+batch_size = 1000
+batch_interval = 0
+threads = 32
+objects = 0
+log_level = "info"
+```
+
+CLI arguments override config file values when explicitly provided.
+
+## CLI Options
+
+Both implementations accept the same flags:
+
+```
+--table-name TEXT       Table to create/insert into (required)
+--duration INTEGER      Minutes to run (required)
+--connection-string     CrateDB URL (overrides .env)
+--batch-size            Records per bulk insert (default: 100)
+--batch-interval        Delay between batches: seconds (Python) / ms (Rust)
+--threads               Concurrent async tasks (default: 1)
+--objects               Extra low-cardinality TEXT columns (default: 0)
+--test-loadbalancer     Run 5-tuple load balancer test and exit
 ```
 
 ## Table Schema
 
-The script creates a table with the following schema:
+Both implementations create identical tables:
 
 ```sql
-CREATE TABLE IF NOT EXISTS your_table_name (
+CREATE TABLE IF NOT EXISTS your_table (
     id TEXT PRIMARY KEY,
     timestamp TIMESTAMP WITH TIME ZONE,
     region TEXT,
@@ -89,363 +100,72 @@ CREATE TABLE IF NOT EXISTS your_table_name (
     amount DOUBLE PRECISION,
     quantity INTEGER,
     metadata OBJECT(DYNAMIC)
-    -- Additional obj_0, obj_1, ... obj_N columns when using --objects flag
-) WITH (
-    number_of_replicas = 0,
-    "refresh_interval" = 1000
-);
+    -- obj_0 TEXT, obj_1 TEXT, ... when using --objects
+) WITH (number_of_replicas = 1)
 ```
 
-### Data Characteristics
+## Performance Tuning
 
-The generated data includes:
-
-**Base Fields (10 columns):**
-- **Regions**: 4 options (us-east, us-west, eu-central, ap-southeast)
-- **Product Categories**: 5 options (electronics, books, clothing, home, sports)
-- **Event Types**: 5 options (view, click, purchase, cart_add, cart_remove)
-- **User Segments**: 4 options (premium, standard, basic, trial)
-- **User IDs**: Random integers 1-10,000
-- **Amounts**: Random decimals 1.0-1000.0
-- **Quantities**: Random integers 1-100
-- **Metadata**: JSON with browser, OS, and session information
-
-**Object Fields (when using --objects):**
-- **obj_0, obj_1, ... obj_N**: Low cardinality TEXT fields
-- **Values**: Each object has 3-8 possible values (e.g., "val_0", "val_1", "val_2")
-- **Use Cases**: Wide table testing, column performance analysis, realistic schemas
-
-## Usage
-
-### Basic Usage
+For maximum throughput against a remote cluster:
 
 ```bash
-# Activate virtual environment
-source .venv/bin/activate
+# Python
+uv run crate-write --table-name perf --duration 5 --threads 64 --batch-size 1000 --batch-interval 0
 
-# Run for 5 minutes inserting into 'test_events' table
-crate-write --table-name test_events --duration 5
+# Rust
+cargo run -- --table-name perf --duration 5 --threads 64 --batch-size 1000 --batch-interval 0
 ```
 
-### Advanced Usage
+Key parameters:
+- **--threads 32-128**: More concurrent tasks = more HTTP requests in-flight while waiting for responses
+- **--batch-size 1000-5000**: Larger batches = fewer HTTP roundtrips
+- **--batch-interval 0**: No artificial delay between batches
 
-```bash
-# Custom batch size and interval
-crate-write \
-    --table-name my_table \
-    --duration 10 \
-    --batch-size 200 \
-    --batch-interval 0.05
+The bottleneck is typically CrateDB ingestion speed and network latency, not the client.
 
-# High-pressure testing with multiple threads
-crate-write \
-    --table-name stress_test \
-    --duration 5 \
-    --batch-size 100 \
-    --threads 8
+## Record Verification
 
-# Wide table testing with many columns
-crate-write \
-    --table-name wide_table \
-    --duration 3 \
-    --objects 100
+Both implementations verify records after completion:
 
-# Override connection string
-crate-write \
-    --table-name my_table \
-    --duration 5 \
-    --connection-string "http://admin:mypass@crate.example.com:4200"
-```
-
-### Command Line Options
-
-- `--table-name`: **Required**. Name of the CrateDB table to create/insert into
-- `--duration`: **Required**. Duration to run in minutes
-- `--connection-string`: CrateDB connection string (overrides .env)
-- `--batch-size`: Records per batch (default: 100)
-- `--batch-interval`: Seconds between batches (default: 0.1)
-- `--threads`: Number of parallel worker threads (default: 1)
-- `--objects`: Number of additional low-cardinality object columns (default: 0)
-
-## Performance Monitoring
-
-The script provides real-time performance monitoring:
-
-### During Execution
-- Reports every 10 seconds with current and average insertion rates
-- Shows total records inserted and error count
-- Displays batch statistics
-
-### Final Summary
-After completion, you'll see a comprehensive performance report:
-
-```
-============================================================
-FINAL PERFORMANCE SUMMARY
-============================================================
-Worker threads: 8
-Total records inserted: 1,234,567
-Total batches: 12,346
-Total runtime: 300.5 seconds
-Average insertion rate: 4,109.2 records/second
-Records per thread: 154,320 avg
-Total errors: 0
-============================================================
-```
-
-## Example Output
-
-### Basic Usage
-```
-2024-01-15 10:30:00 | INFO     | Starting CrateDB record generator
-2024-01-15 10:30:00 | INFO     | Table: test_events
-2024-01-15 10:30:00 | INFO     | Duration: 5 minutes
-2024-01-15 10:30:00 | INFO     | Batch size: 100
-2024-01-15 10:30:00 | INFO     | Batch interval: 0.1s
-2024-01-15 10:30:00 | SUCCESS  | Table 'test_events' created successfully
-2024-01-15 10:30:00 | INFO     | Starting record generation and insertion...
-2024-01-15 10:30:10 | INFO     | Performance: 985.2 records/sec (current), 987.1 records/sec (avg), Total: 9,871 records, Batches: 98, Threads: 1, Errors: 0
-```
-
-### Wide Table Usage (--objects 50)
-```
-2024-01-15 10:30:00 | INFO     | Starting CrateDB record generator
-2024-01-15 10:30:00 | INFO     | Table: wide_test
-2024-01-15 10:30:00 | INFO     | Object columns: 50
-2024-01-15 10:30:00 | SUCCESS  | Table 'wide_test' created successfully (60 total columns)
-2024-01-15 10:30:10 | INFO     | Performance: 750.3 records/sec (current), 750.3 records/sec (avg), Total: 7,503 records, Batches: 75, Threads: 1, Errors: 0
-...
-```
+1. `REFRESH TABLE` to flush pending writes
+2. `SELECT COUNT(*)` to get actual row count
+3. Compare against records sent, report match or mismatch
 
 ## Load Balancer Testing
 
-The script automatically performs a 5-tuple load balancer test at startup to verify proper distribution across CrateDB cluster nodes.
+Both implementations include a 5-tuple load balancer distribution test:
 
-### 5-Tuple Test Details
+```bash
+# Python
+uv run crate-write --test-loadbalancer
 
-Before starting the main workload, the script:
-
-1. **Creates 30 fresh TCP connections** to the CrateDB cluster
-2. **Uses different source ports** for each connection (5-tuple hashing)
-3. **Measures distribution** across available nodes
-4. **Displays visual summary** of load balancer behavior
-
-### Example Output
-
-```
-🔍 5-TUPLE LOAD BALANCER TEST
-============================================================
-Target: your-cluster.cratedb.net:4200 (HTTPS)
-Requests: 30 (each with fresh TCP connection)
-
-📈 NODE DISTRIBUTION:
-   data-hot-0      |  10 hits |  33.3% | ████████████████
-   data-hot-1      |   7 hits |  23.3% | ███████████
-   data-hot-2      |  13 hits |  43.3% | █████████████████████
-
-✅ Load balancer IS distributing across nodes
-Evidence: 30 source ports hit 3 different nodes
+# Rust
+cargo run -- --test-loadbalancer
 ```
 
-### What This Means
+This creates fresh TCP connections to test whether the load balancer distributes traffic across CrateDB nodes using 5-tuple hashing.
 
-- **✅ Optimal Distribution**: Each worker thread will connect to a different node at startup
-- **🔄 Persistent Connections**: After initial distribution, each thread reuses its connection efficiently
-- **📊 Performance Confidence**: You can trust that multi-threaded tests will utilize all cluster nodes
-
-### Interpreting Results
-
-- **Multiple nodes hit**: Load balancer is working correctly
-- **Single node hit**: May indicate load balancer misconfiguration or single healthy node
-- **Uneven distribution**: Normal due to hash distribution; becomes more even with more connections
-
-## Development
-
-### Project Structure
+## Project Structure
 
 ```
-crate-write/
+.
 ├── crate_write/
 │   ├── __init__.py
-│   └── main.py          # Main application logic
-├── pyproject.toml       # Project configuration and dependencies
-├── .env                 # Environment configuration
-└── README.md           # This file
+│   └── main.py              # Python async engine (aiohttp)
+├── rust/
+│   ├── src/
+│   │   ├── main.rs           # CLI, table creation, worker loop
+│   │   ├── client.rs          # HTTP client (reqwest)
+│   │   ├── generator.rs       # Record generation
+│   │   ├── monitor.rs         # Atomic performance counters
+│   │   └── config.rs          # TOML/JSON config loading
+│   ├── config.toml            # Default config
+│   └── Cargo.toml
+├── pyproject.toml
+├── .env                       # Connection string (gitignored)
+└── README.md
 ```
-
-### Running in Development
-
-```bash
-# Activate virtual environment
-source .venv/bin/activate
-
-# Install in development mode
-uv pip install -e .
-
-# Run directly with python
-python -m crate_write.main --table-name test --duration 1
-```
-
-### Dependencies
-
-- **click**: Command-line interface
-- **loguru**: Structured logging
-- **python-dotenv**: Environment variable management
-- **crate[sqlalchemy]**: CrateDB Python client
-- **requests**: HTTP client for CrateDB REST API
-- **faker**: Realistic fake data generation
-
-## Troubleshooting
-
-### Connection Issues
-
-If you encounter connection errors:
-
-1. Verify CrateDB is running and accessible
-2. Check the connection string format: `http://[username:password@]host:port`
-3. Ensure firewall allows connections to CrateDB port (default: 4200)
-
-### Performance Issues
-
-To optimize performance:
-
-1. Increase `--batch-size` for higher throughput
-2. Decrease `--batch-interval` for faster insertion
-3. Increase `--threads` for parallel load (start with CPU cores)
-4. Ensure CrateDB has sufficient resources
-5. Consider adjusting the table's `refresh_interval`
-
-### Memory Issues
-
-For long-running sessions:
-
-1. Monitor memory usage of both the script and CrateDB
-2. Consider reducing batch size if memory usage is high
-3. Ensure adequate swap space is available
-
----
-
-## 🦀 Rust Implementation (High Performance)
-
-For maximum performance and production workloads, use the Rust implementation located in the `rust/` directory.
-
-### Quick Start (Rust)
-
-#### Prerequisites
-- [Rust 1.70+](https://rustup.rs/) installed
-- CrateDB connection details
-
-#### Setup & Build
-```bash
-# Navigate to Rust implementation
-cd rust
-
-# Build optimized release binary (one-time setup)
-cargo build --release
-
-# Set up environment variables
-cp ../.env .env  # Copy from parent directory
-# Or create new .env with your connection string:
-echo "CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200" > .env
-```
-
-#### Usage
-```bash
-# Basic usage (reads connection from .env file)
-./target/release/crate-write --table-name rust_test --duration 5
-
-# High-performance stress test
-./target/release/crate-write \
-    --table-name stress_test \
-    --duration 2 \
-    --threads 32 \
-    --batch-size 6000 \
-    --batch-interval 0
-
-# Wide table testing
-./target/release/crate-write \
-    --table-name wide_test \
-    --duration 3 \
-    --objects 200 \
-    --threads 8
-```
-
-### Performance Comparison
-
-| Implementation | Typical Performance | Max Threads | Memory Usage | Setup Complexity |
-|----------------|-------------------|-------------|--------------|------------------|
-| **Python** | 1,000-5,000 rec/sec | 8-16 | ~50-200MB | Easy |
-| **Rust** | 10,000-20,000+ rec/sec | 32+ | ~5-50MB | Medium |
-
-### Rust-Specific Features
-
-- **True Concurrency**: No GIL limitations, uses all CPU cores effectively
-- **Memory Efficient**: 10x lower memory usage than Python
-- **Zero Copy**: Optimized data handling for maximum throughput
-- **Production Ready**: Comprehensive error handling and logging
-- **Single Binary**: No runtime dependencies after compilation
-
-### Command Line Options (Rust)
-
-All Python options are supported with identical syntax:
-
-```bash
-./target/release/crate-write \
-    --table-name <TABLE_NAME> \
-    --duration <MINUTES> \
-    [--connection-string <URL>] \
-    [--batch-size <SIZE>] \
-    [--batch-interval <MS>] \
-    [--threads <COUNT>] \
-    [--objects <COUNT>] \
-    [--log-level <LEVEL>]
-```
-
-### Environment Configuration (Rust)
-
-Create `rust/.env` file:
-```env
-# Required: CrateDB connection string
-CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200
-
-# Optional: Logging level
-LOG_LEVEL=info
-```
-
-### Example Output (Rust)
-
-```
-🚀 CrateDB Record Generator (Rust)
-Connection: https://your-cluster:4200
-✅ Table 'stress_test' created successfully
-Starting 32 worker tasks...
-Performance: 18,186.2 records/sec (avg), Total: 2,196,000 records, Threads: 32, Errors: 0
-✅ Average insertion rate: 18,186.2 records/second
-```
-
-### When to Use Rust Implementation
-
-**Choose Rust for:**
-- ✅ **Stress testing** (>10,000 records/sec)
-- ✅ **Production workloads** with high throughput requirements
-- ✅ **Resource-constrained environments** (limited memory/CPU)
-- ✅ **Long-running tests** (hours/days of continuous insertion)
-- ✅ **Wide table testing** (hundreds of columns)
-
-**Choose Python for:**
-- ✅ **Development and prototyping**
-- ✅ **Load balancer analysis** (5-tuple testing)
-- ✅ **Moderate workloads** (<5,000 records/sec)
-- ✅ **Quick setup** and familiar tooling
-
-### Documentation
-
-- **Detailed Rust documentation**: See `README-rust.md`
-- **Performance analysis**: See `THREADING_ANALYSIS.md`
-- **Configuration guide**: See `BATCH_INTERVAL_GUIDE.md`
-
----
 
 ## License
 
-This project is licensed under the MIT License.
+MIT
