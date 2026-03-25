@@ -9,11 +9,13 @@ performance monitoring and reporting.
 import os
 import sys
 import time
+import asyncio
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional, Tuple
 import random
 import json
+import ssl
 
 import click
 from loguru import logger
@@ -22,6 +24,7 @@ from faker import Faker
 import requests
 from requests.auth import HTTPBasicAuth
 from urllib.parse import urlparse
+import aiohttp
 
 
 def sanitize_connection_string(connection_string: str) -> str:
@@ -221,6 +224,262 @@ class RecordGenerator:
     def generate_batch(self, batch_size: int) -> List[List[Any]]:
         """Generate a batch of records."""
         return [self.generate_record() for _ in range(batch_size)]
+
+
+class AsyncCrateClient:
+    """Async HTTP client for CrateDB using aiohttp for maximum throughput."""
+
+    def __init__(self, session: aiohttp.ClientSession, base_url: str):
+        self.session = session
+        self.base_url = base_url
+        self.sql_url = f"{base_url}/_sql"
+
+    async def execute_bulk(self, sql: str, bulk_args: List[List]) -> dict:
+        """Execute bulk insert with async HTTP."""
+        payload = {"stmt": sql, "bulk_args": bulk_args}
+        async with self.session.post(
+            self.sql_url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def execute(self, sql: str) -> dict:
+        """Execute a SQL statement."""
+        payload = {"stmt": sql}
+        async with self.session.post(
+            self.sql_url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
+            response.raise_for_status()
+            return await response.json()
+
+
+class AsyncPerformanceMonitor:
+    """Lock-free performance monitor for single-threaded async event loop."""
+
+    def __init__(self):
+        self.start_time = time.monotonic()
+        self.total_records = 0
+        self.total_batches = 0
+        self.errors = 0
+        self.last_report_time = time.monotonic()
+        self.last_report_records = 0
+
+    def add_records(self, count: int):
+        self.total_records += count
+        self.total_batches += 1
+
+    def add_error(self):
+        self.errors += 1
+
+    def get_current_rate(self) -> float:
+        now = time.monotonic()
+        time_diff = now - self.last_report_time
+        if time_diff < 1.0:
+            return 0.0
+        records_diff = self.total_records - self.last_report_records
+        rate = records_diff / time_diff
+        self.last_report_time = now
+        self.last_report_records = self.total_records
+        return rate
+
+    def get_overall_stats(self) -> Dict[str, Any]:
+        elapsed = time.monotonic() - self.start_time
+        return {
+            "total_records": self.total_records,
+            "total_batches": self.total_batches,
+            "elapsed_time": elapsed,
+            "overall_rate": self.total_records / elapsed if elapsed > 0 else 0,
+            "errors": self.errors,
+        }
+
+
+async def async_worker(
+    worker_id: int,
+    client: AsyncCrateClient,
+    insert_sql: str,
+    batch_size: int,
+    batch_interval: float,
+    monitor: AsyncPerformanceMonitor,
+    stop_event: asyncio.Event,
+    num_objects: int,
+):
+    """Async worker task: generate batch → POST → repeat. No GIL contention."""
+    generator = RecordGenerator(num_objects)
+
+    while not stop_event.is_set():
+        try:
+            batch = generator.generate_batch(batch_size)
+            await client.execute_bulk(insert_sql, batch)
+            monitor.add_records(batch_size)
+
+            if batch_interval > 0:
+                await asyncio.sleep(batch_interval)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Worker {worker_id} error: {e}")
+            monitor.add_error()
+            await asyncio.sleep(min(5.0, 1.0))
+
+
+async def async_reporter(monitor: AsyncPerformanceMonitor, stop_event: asyncio.Event, num_tasks: int):
+    """Report performance every 10 seconds."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            break
+        rate = monitor.get_current_rate()
+        stats = monitor.get_overall_stats()
+        logger.info(
+            f"Performance: {rate:.1f} records/sec (current), "
+            f"{stats['overall_rate']:.1f} records/sec (avg), "
+            f"Total: {stats['total_records']:,} records, "
+            f"Batches: {stats['total_batches']:,}, "
+            f"Tasks: {num_tasks}, "
+            f"Errors: {stats['errors']}"
+        )
+
+
+async def run_async_engine(
+    connection_string: str,
+    table_name: str,
+    duration: int,
+    batch_size: int,
+    batch_interval: float,
+    num_tasks: int,
+    objects: int,
+):
+    """Main async engine: creates aiohttp session, spawns workers, runs for duration."""
+    parsed = urlparse(connection_string)
+    base_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 4200}"
+
+    # Build auth header
+    auth = None
+    if parsed.username and parsed.password:
+        auth = aiohttp.BasicAuth(parsed.username, parsed.password)
+
+    # TLS: skip verification for self-signed certs (like the sync client)
+    ssl_ctx = None
+    if parsed.scheme == "https":
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    # Connection pool: unlimited connections, persistent keep-alive
+    connector = aiohttp.TCPConnector(
+        limit=0,  # no limit on concurrent connections
+        ttl_dns_cache=300,
+        keepalive_timeout=60,
+        ssl=ssl_ctx,
+    )
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        auth=auth,
+        headers={"Content-Type": "application/json"},
+    ) as session:
+        client = AsyncCrateClient(session, base_url)
+
+        # Create table (reuse sync client for setup)
+        setup_client = CrateDBClient(connection_string)
+        create_table(setup_client, table_name, objects)
+
+        # Prepare insert SQL
+        base_fields = "id, timestamp, region, product_category, event_type, user_id, user_segment, amount, quantity, metadata"
+        base_placeholders = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+        if objects > 0:
+            object_fields = ", " + ", ".join([f"obj_{i}" for i in range(objects)])
+            object_placeholders = ", " + ", ".join(["?" for _ in range(objects)])
+        else:
+            object_fields = ""
+            object_placeholders = ""
+
+        insert_sql = f"INSERT INTO {table_name} ({base_fields}{object_fields}) VALUES ({base_placeholders}{object_placeholders})"
+
+        monitor = AsyncPerformanceMonitor()
+        stop_event = asyncio.Event()
+
+        # Spawn reporter
+        reporter_task = asyncio.create_task(
+            async_reporter(monitor, stop_event, num_tasks)
+        )
+
+        # Spawn workers
+        worker_tasks = []
+        for i in range(num_tasks):
+            task = asyncio.create_task(
+                async_worker(i, client, insert_sql, batch_size, batch_interval, monitor, stop_event, objects)
+            )
+            worker_tasks.append(task)
+
+        logger.info(f"Started {num_tasks} async worker tasks...")
+
+        # Run for duration or until Ctrl+C
+        try:
+            await asyncio.sleep(duration * 60)
+            logger.info("Duration completed, stopping workers...")
+        except asyncio.CancelledError:
+            logger.warning("Received interrupt, stopping workers...")
+
+        # Signal stop and wait for workers
+        stop_event.set()
+        for task in worker_tasks:
+            task.cancel()
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+        reporter_task.cancel()
+        try:
+            await reporter_task
+        except asyncio.CancelledError:
+            pass
+
+        # Final stats
+        final_stats = monitor.get_overall_stats()
+        logger.info("=" * 60)
+        logger.info("FINAL PERFORMANCE SUMMARY")
+        logger.info("=" * 60)
+        logger.success(f"Async worker tasks: {num_tasks}")
+        logger.success(f"Total records sent: {final_stats['total_records']:,}")
+        logger.success(f"Total batches: {final_stats['total_batches']:,}")
+        logger.success(f"Total runtime: {final_stats['elapsed_time']:.1f} seconds")
+        logger.success(f"Average insertion rate: {final_stats['overall_rate']:.1f} records/second")
+        logger.success(f"Records per task: {final_stats['total_records'] // max(num_tasks, 1):,} avg")
+        logger.success(f"Total errors: {final_stats['errors']}")
+        logger.info("=" * 60)
+
+        # Verify records in CrateDB
+        logger.info("Verifying record count in CrateDB...")
+        try:
+            await client.execute(f"REFRESH TABLE {table_name}")
+            result = await client.execute(f"SELECT COUNT(*) FROM {table_name}")
+            db_count = result.get("rows", [[0]])[0][0]
+            sent = final_stats["total_records"]
+
+            logger.info("=" * 60)
+            logger.info("RECORD VERIFICATION")
+            logger.info("=" * 60)
+            logger.info(f"Records sent by client: {sent:,}")
+            logger.info(f"Records in CrateDB:     {db_count:,}")
+            if db_count == sent:
+                logger.success("MATCH - all records accounted for")
+            elif db_count > sent:
+                logger.info(f"CrateDB has {db_count - sent:,} more records (table had pre-existing data)")
+            else:
+                missing = sent - db_count
+                loss_pct = (missing / sent) * 100 if sent > 0 else 0
+                logger.warning(f"MISMATCH - {missing:,} records missing ({loss_pct:.2f}% loss)")
+            logger.info("=" * 60)
+        except Exception as e:
+            logger.warning(f"Failed to verify record count: {e}")
+
+        if final_stats["errors"] > 0:
+            error_rate = (final_stats["errors"] / max(final_stats["total_batches"], 1)) * 100
+            logger.warning(f"Error rate: {error_rate:.2f}%")
 
 
 def make_fresh_request(connection_string: str) -> Tuple[Dict, str, int, Dict]:
@@ -941,118 +1200,28 @@ def cli(table_name: Optional[str], connection_string: Optional[str], duration: O
         logger.error("--duration is required when not using --test-loadbalancer")
         sys.exit(1)
 
-    logger.info(f"Starting CrateDB record generator")
+    logger.info(f"Starting CrateDB record generator (async engine)")
     logger.info(f"🔗 Connection: {sanitize_connection_string(connection_string)}")
     logger.info(f"Table: {table_name}")
     logger.info(f"Duration: {duration} minutes")
     logger.info(f"Batch size: {batch_size}")
     logger.info(f"Batch interval: {batch_interval}s")
-    logger.info(f"Worker threads: {threads}")
+    logger.info(f"Async worker tasks: {threads}")
     if objects > 0:
         logger.info(f"Object columns: {objects}")
 
     try:
-        # Initialize components
-        client = CrateDBClient(connection_string)
-        monitor = PerformanceMonitor()
-
-        # Sample load balancer distribution first (using 5-tuple test)
-        lb_distribution = sample_load_balancer_5tuple(connection_string)
-
-        # Create table
-        create_table(client, table_name, objects)
-
-        # Prepare insert statement
-        base_fields = "id, timestamp, region, product_category, event_type, user_id, user_segment, amount, quantity, metadata"
-        base_placeholders = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
-
-        if objects > 0:
-            object_fields = ", " + ", ".join([f"obj_{i}" for i in range(objects)])
-            object_placeholders = ", " + ", ".join(["?" for _ in range(objects)])
-        else:
-            object_fields = ""
-            object_placeholders = ""
-
-        insert_sql = f"""
-        INSERT INTO {table_name}
-        ({base_fields}{object_fields})
-        VALUES ({base_placeholders}{object_placeholders})
-        """
-
-        # Start performance reporting thread
-        stop_event = threading.Event()
-        reporter = threading.Thread(
-            target=reporter_thread,
-            args=(monitor, stop_event, threads),
-            daemon=True
-        )
-        reporter.start()
-
-        # Start worker threads
-        workers = []
-        for i in range(threads):
-            worker = threading.Thread(
-                target=worker_thread,
-                args=(i, connection_string, table_name, insert_sql,
-                      batch_size, batch_interval, monitor, stop_event, objects, lb_distribution),
-                daemon=True
-            )
-            workers.append(worker)
-            worker.start()
-
-        logger.info(f"Started {threads} worker threads...")
-
-        # Wait for duration
-        try:
-            time.sleep(duration * 60)
-            logger.info("Duration completed, stopping workers...")
-        except KeyboardInterrupt:
-            logger.warning("Received interrupt signal, stopping workers...")
-
-        # Signal all threads to stop
-        stop_event.set()
-
-        # Wait for all workers to finish (with timeout)
-        logger.info("Waiting for workers to finish...")
-        for i, worker in enumerate(workers):
-            worker.join(timeout=5.0)
-            if worker.is_alive():
-                logger.warning(f"Worker {i} did not finish within timeout")
-
-        # Stop reporting thread
-        stop_event.set()
-
-        # Final performance summary
-        final_stats = monitor.get_overall_stats()
-
-        logger.info("=" * 60)
-        logger.info("FINAL PERFORMANCE SUMMARY")
-        logger.info("=" * 60)
-        logger.success(f"Worker threads: {threads}")
-        logger.success(f"Total records inserted: {final_stats['total_records']:,}")
-        logger.success(f"Total batches: {final_stats['total_batches']:,}")
-        logger.success(f"Total runtime: {final_stats['elapsed_time']:.1f} seconds")
-        logger.success(f"Average insertion rate: {final_stats['overall_rate']:.1f} records/second")
-        logger.success(f"Records per thread: {final_stats['total_records'] // threads:,} avg")
-        logger.success(f"Total errors: {final_stats['errors']}")
-
-        if final_stats['errors'] > 0:
-            error_rate = (final_stats['errors'] / final_stats['total_batches']) * 100
-            logger.warning(f"Error rate: {error_rate:.2f}%")
-
-        # Load balancer distribution summary
-        if lb_distribution:
-            logger.info("Load Balancer Distribution:")
-            node_summary = []
-            total_samples = sum(lb_distribution.values())
-            for node, count in sorted(lb_distribution.items()):
-                percentage = (count / total_samples) * 100 if total_samples > 0 else 0
-                node_summary.append(f"{node}={count} ({percentage:.1f}%)")
-            logger.success(f"Distribution: {', '.join(node_summary)}")
-            logger.info("(Based on 5-tuple HTTP connection test - SQL worker threads distribute similarly at startup)")
-
-        logger.info("=" * 60)
-
+        asyncio.run(run_async_engine(
+            connection_string=connection_string,
+            table_name=table_name,
+            duration=duration,
+            batch_size=batch_size,
+            batch_interval=batch_interval,
+            num_tasks=threads,
+            objects=objects,
+        ))
+    except KeyboardInterrupt:
+        logger.warning("Interrupted")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         sys.exit(1)
