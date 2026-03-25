@@ -370,6 +370,18 @@ async def run_async_engine(
     objects: int,
 ):
     """Main async engine: creates aiohttp session, spawns workers, runs for duration."""
+
+    # Run load balancer distribution test before starting workers
+    logger.info("Running load balancer distribution test...")
+    lb_distribution = sample_load_balancer_5tuple(connection_string)
+    if lb_distribution:
+        node_summary = []
+        total_samples = sum(lb_distribution.values())
+        for node, count in sorted(lb_distribution.items()):
+            pct = (count / total_samples) * 100 if total_samples > 0 else 0
+            node_summary.append(f"{node}={count} ({pct:.1f}%)")
+        logger.info(f"Load balancer distribution: {', '.join(node_summary)}")
+
     parsed = urlparse(connection_string)
     base_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 4200}"
 
