@@ -89,8 +89,8 @@ impl Config {
             anyhow::bail!("Number of threads cannot exceed 1000");
         }
 
-        if self.batch_size > 10000 {
-            anyhow::bail!("Batch size cannot exceed 10000");
+        if self.batch_size > 100000 {
+            anyhow::bail!("Batch size cannot exceed 100000");
         }
 
         if self.batch_interval > 60000 {
