@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use clap::Parser;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn, error};
 
@@ -27,7 +29,7 @@ use config::Config;
 )]
 struct Cli {
     /// Name of the CrateDB table to insert records into
-    #[arg(long, required_unless_present = "test_loadbalancer")]
+    #[arg(long)]
     table_name: Option<String>,
 
     /// CrateDB connection string (can be read from .env file)
@@ -35,7 +37,7 @@ struct Cli {
     connection_string: Option<String>,
 
     /// Duration to run the generator (in minutes)
-    #[arg(long, required_unless_present = "test_loadbalancer")]
+    #[arg(long)]
     duration: Option<u64>,
 
     /// Number of records to insert in each batch
@@ -65,6 +67,10 @@ struct Cli {
     /// Configuration file path
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Run only the 5-tuple load balancer test (no table creation or data insertion)
+    #[arg(long)]
+    test_loadbalancer: bool,
 }
 
 fn sanitize_connection_string(connection_string: &str) -> String {
@@ -268,6 +274,280 @@ async fn run_data_generation(
     Ok(())
 }
 
+struct FreshRequestResult {
+    node_name: String,
+    source_port: u16,
+    connect_time_ms: f64,
+    request_time_ms: f64,
+    total_time_ms: f64,
+}
+
+async fn make_fresh_request(
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    auth_header: Option<&str>,
+) -> Result<FreshRequestResult> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::time::Instant;
+
+    let start_connect = Instant::now();
+
+    let addr = format!("{}:{}", host, port);
+    let stream = tokio::net::TcpStream::connect(&addr).await
+        .with_context(|| format!("Failed to connect to {}", addr))?;
+
+    let source_port = stream.local_addr()?.port();
+    let connect_time = start_connect.elapsed();
+
+    // Build HTTP request
+    let mut http_request = format!(
+        "GET / HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\nUser-Agent: CrateDB-5Tuple-Tester/1.0\r\n",
+        host, port
+    );
+    if let Some(auth) = auth_header {
+        http_request.push_str(&format!("Authorization: {}\r\n", auth));
+    }
+    http_request.push_str("\r\n");
+
+    let start_request = Instant::now();
+
+    if use_tls {
+        let connector = tokio_native_tls::TlsConnector::from(
+            native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .build()?,
+        );
+        let mut tls_stream = connector.connect(host, stream).await?;
+        tls_stream.write_all(http_request.as_bytes()).await?;
+        let mut response_data = Vec::new();
+        tls_stream.read_to_end(&mut response_data).await?;
+        let request_time = start_request.elapsed();
+        let node_name = parse_node_name(&response_data);
+        Ok(FreshRequestResult {
+            node_name,
+            source_port,
+            connect_time_ms: connect_time.as_secs_f64() * 1000.0,
+            request_time_ms: request_time.as_secs_f64() * 1000.0,
+            total_time_ms: start_connect.elapsed().as_secs_f64() * 1000.0,
+        })
+    } else {
+        let mut stream = stream;
+        stream.write_all(http_request.as_bytes()).await?;
+        let mut response_data = Vec::new();
+        stream.read_to_end(&mut response_data).await?;
+        let request_time = start_request.elapsed();
+        let node_name = parse_node_name(&response_data);
+        Ok(FreshRequestResult {
+            node_name,
+            source_port,
+            connect_time_ms: connect_time.as_secs_f64() * 1000.0,
+            request_time_ms: request_time.as_secs_f64() * 1000.0,
+            total_time_ms: start_connect.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+}
+
+fn parse_node_name(response_data: &[u8]) -> String {
+    let response_text = String::from_utf8_lossy(response_data);
+    // Split headers from body
+    if let Some(body_start) = response_text.find("\r\n\r\n") {
+        let body = &response_text[body_start + 4..];
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
+                return shorten_node_name(name);
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+fn shorten_node_name(name: &str) -> String {
+    // Extract pattern like "prefix" + "number" from node names
+    let re_like: Option<(String, String)> = {
+        let mut alpha = String::new();
+        let mut digit = String::new();
+        let mut found_digit = false;
+        for ch in name.chars() {
+            if !found_digit && ch.is_alphabetic() {
+                alpha.push(ch);
+            } else if ch.is_ascii_digit() {
+                found_digit = true;
+                digit.push(ch);
+            }
+        }
+        if !alpha.is_empty() && !digit.is_empty() {
+            Some((alpha, digit))
+        } else {
+            None
+        }
+    };
+
+    match re_like {
+        Some((prefix, num)) => format!("{}-{}", prefix, num),
+        None => name.chars().take(10).collect(),
+    }
+}
+
+async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
+    let parsed = url::Url::parse(connection_string)
+        .context("Invalid connection string")?;
+
+    let host = parsed.host_str().context("Missing hostname")?.to_string();
+    let port = parsed.port().unwrap_or(4200);
+    let use_tls = parsed.scheme() == "https";
+
+    let auth_header = if let Some(password) = parsed.password() {
+        let username = parsed.username();
+        let credentials = format!("{}:{}", username, password);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+        Some(format!("Basic {}", encoded))
+    } else {
+        None
+    };
+
+    println!("🔍 5-TUPLE LOAD BALANCER TEST");
+    println!("{}", "=".repeat(60));
+    println!("Target: {}:{} ({})", host, port, if use_tls { "HTTPS" } else { "HTTP" });
+
+    // Query sys.nodes to determine cluster size
+    let expected_nodes = {
+        let client = CrateClient::new(connection_string).await?;
+        match client.execute_query("SELECT count(*) as node_count FROM sys.nodes").await {
+            Ok(rows) => {
+                if let Some(first) = rows.first() {
+                    if let Some(first_val) = first.first() {
+                        first_val.as_u64().unwrap_or(1) as usize
+                    } else { 1 }
+                } else { 1 }
+            }
+            Err(_) => {
+                println!("⚠️  Could not determine cluster size, assuming 1 node");
+                1
+            }
+        }
+    };
+    println!("✅ Cluster has {} node(s)", expected_nodes);
+
+    let num_requests = std::cmp::max(30, expected_nodes * 30);
+    println!("📊 Test plan: {} requests ({} per expected node)", num_requests, num_requests / expected_nodes);
+    println!();
+
+    println!("📊 Request Details:");
+    println!("Req# |    Node    | SrcPort | ConnTime | ReqTime | TotalTime");
+    println!("{}", "-".repeat(65));
+
+    let mut node_counts: HashMap<String, usize> = HashMap::new();
+    let mut source_ports: Vec<u16> = Vec::new();
+    let mut failed_requests = 0usize;
+    let mut successful_requests = 0usize;
+    let mut total_connect_ms = 0.0f64;
+    let mut total_request_ms = 0.0f64;
+    let mut total_time_ms = 0.0f64;
+
+    for i in 0..num_requests {
+        match make_fresh_request(&host, port, use_tls, auth_header.as_deref()).await {
+            Ok(result) => {
+                if result.node_name == "unknown" || result.node_name.starts_with("error") {
+                    failed_requests += 1;
+                    println!("{:4} | {:10} | {:>7} | {:>8} | {:>7} | ERROR", i + 1, "ERROR", "N/A", "N/A", "N/A");
+                } else {
+                    *node_counts.entry(result.node_name.clone()).or_insert(0) += 1;
+                    source_ports.push(result.source_port);
+                    successful_requests += 1;
+                    total_connect_ms += result.connect_time_ms;
+                    total_request_ms += result.request_time_ms;
+                    total_time_ms += result.total_time_ms;
+
+                    println!(
+                        "{:4} | {:10} | {:7} | {:6.1}ms | {:5.1}ms | {:7.1}ms",
+                        i + 1, result.node_name, result.source_port,
+                        result.connect_time_ms, result.request_time_ms, result.total_time_ms
+                    );
+                }
+            }
+            Err(e) => {
+                failed_requests += 1;
+                println!("{:4} | {:10} | {:>7} | {:>8} | {:>7} | {}", i + 1, "ERROR", "N/A", "N/A", "N/A", e);
+            }
+        }
+
+        // Small delay to ensure different source ports
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    println!("{}", "-".repeat(65));
+
+    let unique_ports = source_ports.iter().collect::<std::collections::HashSet<_>>().len();
+    let unique_nodes = node_counts.len();
+
+    // Summary
+    println!("\n📊 SUMMARY:");
+    println!("   Total requests: {}", num_requests);
+    println!("   Successful: {}", successful_requests);
+    println!("   Failed: {}", failed_requests);
+    println!("   Unique source ports: {}", unique_ports);
+    println!("   Unique nodes hit: {}", unique_nodes);
+
+    if successful_requests > 0 {
+        println!("   Avg connect time: {:.1}ms", total_connect_ms / successful_requests as f64);
+        println!("   Avg request time: {:.1}ms", total_request_ms / successful_requests as f64);
+        println!("   Avg total time: {:.1}ms", total_time_ms / successful_requests as f64);
+    }
+
+    // Distribution
+    println!("\n📈 NODE DISTRIBUTION:");
+    let mut sorted_nodes: Vec<_> = node_counts.iter().collect();
+    sorted_nodes.sort_by_key(|(name, _)| name.clone());
+    for (name, count) in &sorted_nodes {
+        let percentage = (**count as f64 / successful_requests as f64) * 100.0;
+        let bar = "█".repeat((percentage / 2.0) as usize);
+        println!("   {:15} | {:3} hits | {:5.1}% | {}", name, count, percentage, bar);
+    }
+
+    // 5-tuple analysis
+    println!("\n🔍 5-TUPLE LOAD BALANCING ANALYSIS:");
+    if unique_ports < 2 {
+        println!("   ❌ INCONCLUSIVE: Need more unique source ports to test");
+    } else {
+        println!("   ✅ Good test conditions: {} different source ports", unique_ports);
+
+        if unique_nodes == 1 {
+            println!("   🚨 VERDICT: Load balancer NOT using 5-tuple distribution");
+            println!("   📝 Evidence: {} different source ports, but all hit same node", unique_ports);
+        } else if unique_nodes > 1 {
+            println!("   ✅ VERDICT: Load balancer IS distributing across nodes");
+            println!("   📝 Evidence: {} source ports hit {} different nodes", unique_ports, unique_nodes);
+        }
+    }
+
+    // Final verdict
+    println!("\n{}", "=".repeat(60));
+    println!("🎯 FINAL VERDICT");
+    println!("{}", "=".repeat(60));
+    println!("📊 CLUSTER ANALYSIS:");
+    println!("   Expected nodes: {}", expected_nodes);
+    println!("   Nodes hit during test: {}", unique_nodes);
+
+    if unique_nodes == expected_nodes {
+        println!("   ✅ Perfect distribution - hit all {} nodes", expected_nodes);
+    } else if unique_nodes < expected_nodes {
+        println!("   ⚠️  Partial distribution - hit {}/{} nodes", unique_nodes, expected_nodes);
+    } else {
+        println!("   🤔 Unexpected - hit more nodes ({}) than expected ({})", unique_nodes, expected_nodes);
+    }
+
+    if unique_nodes == 1 && unique_ports > 5 {
+        println!("\n🚨 CONFIRMED: Load balancer NOT using 5-tuple distribution");
+        println!("💡 Contact CrateDB Cloud support about load balancer config");
+    } else if unique_nodes > 1 {
+        println!("\n✅ Load balancer IS distributing traffic across nodes");
+        println!("🔧 Performance tests will distribute across nodes");
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load environment variables from .env file FIRST
@@ -306,9 +586,37 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Load configuration
+    // Handle load balancer test mode
+    if cli.test_loadbalancer {
+        // Need a connection string for the test
+        let connection_string = cli.connection_string
+            .or_else(|| std::env::var("CRATE_CONNECTION_STRING").ok())
+            .context("Connection string required: use --connection-string or CRATE_CONNECTION_STRING env var")?;
+
+        info!("🚀 CrateDB 5-Tuple Load Balancer Test");
+        info!("{}", "=".repeat(60));
+        info!("This test creates fresh TCP connections to properly test");
+        info!("whether load balancers use 5-tuple hashing for distribution.");
+        info!("🔗 Connection: {}", sanitize_connection_string(&connection_string));
+
+        match test_5tuple_distribution(&connection_string).await {
+            Ok(_) => {
+                info!("✅ Load balancer test completed successfully");
+                return Ok(());
+            }
+            Err(e) => {
+                error!("❌ Load balancer test failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Load configuration: explicit --config, or auto-detect config.toml, or defaults
     let mut config = if let Some(config_path) = cli.config {
         Config::from_file(&config_path)?
+    } else if Path::new("config.toml").exists() {
+        info!("✅ Auto-detected config.toml in current directory");
+        Config::from_file("config.toml")?
     } else {
         Config::default()
     };

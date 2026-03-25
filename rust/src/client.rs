@@ -153,6 +153,17 @@ impl CrateClient {
 
 
 
+    pub async fn execute_query(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
+        let request = SqlRequest {
+            stmt: sql.to_string(),
+            args: None,
+            bulk_args: None,
+        };
+
+        let resp = self.make_request(&request).await?;
+        Ok(resp.rows)
+    }
+
     pub async fn test_connection(&self) -> Result<()> {
         self.execute("SELECT 1", &[]).await?;
         Ok(())
