@@ -56,7 +56,7 @@ impl RecordGenerator {
         }
     }
 
-    pub async fn generate_record(&self) -> Record {
+    pub fn generate_record(&self) -> Record {
         let id = Uuid::new_v4().to_string();
         let timestamp = Utc::now();
 
@@ -106,33 +106,34 @@ impl RecordGenerator {
         }
     }
 
-    pub async fn generate_batch(&self, batch_size: usize) -> Vec<Record> {
+    pub fn generate_batch(&self, batch_size: usize) -> Vec<Record> {
         let mut batch = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
-            batch.push(self.generate_record().await);
+            batch.push(self.generate_record());
         }
         batch
     }
 }
 
 impl Record {
-    pub fn to_params(&self) -> Vec<Value> {
+    /// Consume the record and convert to params, avoiding clones
+    pub fn into_params(self) -> Vec<Value> {
         let mut params = vec![
-            json!(self.id),
-            json!(self.timestamp.to_rfc3339()),
-            json!(self.region),
-            json!(self.product_category),
-            json!(self.event_type),
+            Value::String(self.id),
+            Value::String(self.timestamp.to_rfc3339()),
+            Value::String(self.region),
+            Value::String(self.product_category),
+            Value::String(self.event_type),
             json!(self.user_id),
-            json!(self.user_segment),
+            Value::String(self.user_segment),
             json!(self.amount),
             json!(self.quantity),
-            self.metadata.clone(),
+            self.metadata, // moved, not cloned
         ];
 
         // Add object columns
-        for obj_val in &self.objects {
-            params.push(json!(obj_val));
+        for obj_val in self.objects {
+            params.push(Value::String(obj_val));
         }
 
         params
@@ -143,10 +144,10 @@ impl Record {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_record_generation() {
+    #[test]
+    fn test_record_generation() {
         let generator = RecordGenerator::new(0);
-        let record = generator.generate_record().await;
+        let record = generator.generate_record();
 
         assert!(!record.id.is_empty());
         assert!(record.user_id >= 1 && record.user_id <= 10000);
@@ -155,10 +156,10 @@ mod tests {
         assert!(record.objects.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_record_generation_with_objects() {
+    #[test]
+    fn test_record_generation_with_objects() {
         let generator = RecordGenerator::new(3);
-        let record = generator.generate_record().await;
+        let record = generator.generate_record();
 
         assert_eq!(record.objects.len(), 3);
         for (i, obj_val) in record.objects.iter().enumerate() {
@@ -166,10 +167,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_batch_generation() {
+    #[test]
+    fn test_batch_generation() {
         let generator = RecordGenerator::new(2);
-        let batch = generator.generate_batch(10).await;
+        let batch = generator.generate_batch(10);
 
         assert_eq!(batch.len(), 10);
 
@@ -196,7 +197,7 @@ mod tests {
             objects: vec!["obj0_val_1".to_string(), "obj1_val_2".to_string()],
         };
 
-        let params = record.to_params();
+        let params = record.into_params();
         assert_eq!(params.len(), 12); // 10 base + 2 objects
 
         assert_eq!(params[0], json!("test-id"));

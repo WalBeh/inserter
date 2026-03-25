@@ -178,22 +178,22 @@ async fn run_data_generation(
                         break;
                     }
                     _ = async {
-                        // Generate batch
-                        let batch = generator.generate_batch(batch_size).await;
+                        // Generate batch (sync — no async overhead for CPU work)
+                        let batch = generator.generate_batch(batch_size);
 
-                        // Convert to parameters
+                        // Convert to parameters, consuming records (no clones)
                         let params: Vec<Vec<serde_json::Value>> = batch.into_iter()
-                            .map(|record| record.to_params())
+                            .map(|record| record.into_params())
                             .collect();
 
-                        // Insert batch
-                        match client.execute_bulk(&insert_sql, &params).await {
+                        // Insert batch (owned Vec — no .to_vec() copy)
+                        match client.execute_bulk(&insert_sql, params).await {
                             Ok(_) => {
-                                monitor.add_records(batch_size).await;
+                                monitor.add_records(batch_size);
                             }
                             Err(e) => {
                                 error!("Worker {} error: {}", worker_id, e);
-                                monitor.add_error().await;
+                                monitor.add_error();
                             }
                         }
 
@@ -258,18 +258,55 @@ async fn run_data_generation(
     let _ = reporting_task.await;
 
     // Final statistics
-    let final_stats = monitor.get_final_stats().await;
+    let final_stats = monitor.get_final_stats_async().await;
     info!("{}", "=".repeat(60));
     info!("FINAL PERFORMANCE SUMMARY");
     info!("{}", "=".repeat(60));
     info!("✅ Worker threads: {}", config.threads);
-    info!("✅ Total records inserted: {}", final_stats.total_records);
+    info!("✅ Total records sent: {}", final_stats.total_records);
     info!("✅ Total batches: {}", final_stats.total_batches);
     info!("✅ Total runtime: {:.1} seconds", final_stats.runtime_seconds);
     info!("✅ Average insertion rate: {:.1} records/second", final_stats.average_rate);
     info!("✅ Records per thread: {:.0} avg", final_stats.total_records as f64 / config.threads as f64);
     info!("✅ Total errors: {}", final_stats.total_errors);
     info!("{}", "=".repeat(60));
+
+    // Verify records in CrateDB match what we sent
+    info!("Verifying record count in CrateDB...");
+
+    // Refresh the table to ensure all records are visible
+    let refresh_sql = format!("REFRESH TABLE {}", table_name);
+    if let Err(e) = client.execute(&refresh_sql, &[]).await {
+        warn!("Failed to refresh table: {}", e);
+    }
+
+    let count_sql = format!("SELECT COUNT(*) FROM {}", table_name);
+    match client.execute_query(&count_sql).await {
+        Ok(rows) => {
+            if let Some(count) = rows.first().and_then(|r| r.first()).and_then(|v| v.as_u64()) {
+                let sent = final_stats.total_records;
+                info!("{}", "=".repeat(60));
+                info!("RECORD VERIFICATION");
+                info!("{}", "=".repeat(60));
+                info!("Records sent by client: {}", sent);
+                info!("Records in CrateDB:     {}", count);
+                if count == sent {
+                    info!("✅ MATCH - all records accounted for");
+                } else if count > sent {
+                    info!("ℹ️  CrateDB has {} more records (table had pre-existing data)", count - sent);
+                } else {
+                    let missing = sent - count;
+                    let loss_pct = (missing as f64 / sent as f64) * 100.0;
+                    warn!("⚠️  MISMATCH - {} records missing ({:.2}% loss)", missing, loss_pct);
+                    warn!("   Possible causes: bulk insert partial failures, replication lag");
+                }
+                info!("{}", "=".repeat(60));
+            }
+        }
+        Err(e) => {
+            warn!("Failed to verify record count: {}", e);
+        }
+    }
 
     Ok(())
 }
@@ -642,8 +679,10 @@ async fn main() -> Result<()> {
     info!("🚀 CrateDB Record Generator (Rust)");
     info!("Connection: {}", sanitize_connection_string(config.connection_string.as_ref().unwrap()));
 
-    // Create client
-    let client = CrateClient::new(config.connection_string.as_ref().unwrap()).await?;
+    // Create client with connection pool sized to thread count
+    let pool_size = std::cmp::max(config.threads + 2, 10);
+    let client = CrateClient::with_pool_size(config.connection_string.as_ref().unwrap(), pool_size).await?;
+    info!("Connection pool size: {}", pool_size);
 
     // Create performance monitor
     let monitor = PerformanceMonitor::new();

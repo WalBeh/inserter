@@ -26,19 +26,21 @@ struct SqlRequest {
 #[derive(Debug, Deserialize)]
 pub struct SqlResponse {
     #[serde(default)]
-    rows: Vec<Vec<Value>>,
+    pub rows: Vec<Vec<Value>>,
     #[serde(default)]
-    rowcount: i64,
+    pub rowcount: i64,
     #[serde(default)]
-    duration: f64,
+    pub duration: f64,
     #[serde(default)]
     cols: Vec<String>,
 }
 
-
-
 impl CrateClient {
     pub async fn new(connection_string: &str) -> Result<Self> {
+        Self::with_pool_size(connection_string, 50).await
+    }
+
+    pub async fn with_pool_size(connection_string: &str, pool_size: usize) -> Result<Self> {
         let url = Url::parse(connection_string)
             .with_context(|| format!("Invalid connection string: {}", connection_string))?;
 
@@ -61,9 +63,9 @@ impl CrateClient {
 
         // Build HTTP client with optimized settings
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(60))
             .tcp_keepalive(std::time::Duration::from_secs(60))
-            .pool_max_idle_per_host(50)
+            .pool_max_idle_per_host(pool_size)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .user_agent("crate-write-rs/0.1.0")
             .build()
@@ -127,7 +129,8 @@ impl CrateClient {
         self.make_request(&request).await.map(|_| ())
     }
 
-    pub async fn execute_bulk(&self, sql: &str, bulk_args: &[Vec<Value>]) -> Result<()> {
+    /// Accept owned bulk_args to avoid copying the entire payload
+    pub async fn execute_bulk(&self, sql: &str, bulk_args: Vec<Vec<Value>>) -> Result<()> {
         if bulk_args.is_empty() {
             return Ok(());
         }
@@ -135,7 +138,7 @@ impl CrateClient {
         let request = SqlRequest {
             stmt: sql.to_string(),
             args: None,
-            bulk_args: Some(bulk_args.to_vec()),
+            bulk_args: Some(bulk_args), // moved, not copied
         };
 
         match self.make_request(&request).await {
@@ -145,13 +148,11 @@ impl CrateClient {
                 Ok(())
             }
             Err(e) => {
-                error!("Bulk insert failed for {} records: {}", bulk_args.len(), e);
+                error!("Bulk insert failed: {}", e);
                 Err(e)
             }
         }
     }
-
-
 
     pub async fn execute_query(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
         let request = SqlRequest {

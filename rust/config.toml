@@ -1,10 +1,10 @@
 table_name = "performance_test"
-connection_string = "https://admin:hugohugohugohugoxxxxxxxxxxxxxxxxxxxxxxxxxx@xdemo.eks1.us-east-1.aws.cratedb-dev.net:4200"
+# connection_string from .env or CRATE_CONNECTION_STRING env var
 
 duration = 10
-batch_size = 500
-batch_interval = 50
-threads = 8
+batch_size = 1000
+batch_interval = 0
+threads = 32
 objects = 0
-dashboard = true
+dashboard = false
 log_level = "info"
