@@ -19,6 +19,7 @@ pub struct Record {
     pub objects: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct RecordGenerator {
     regions: Vec<&'static str>,
     product_categories: Vec<&'static str>,

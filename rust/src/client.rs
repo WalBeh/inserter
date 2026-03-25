@@ -132,31 +132,32 @@ impl CrateClient {
         self.make_request(&request).await.map(|_| ())
     }
 
-    /// Accept owned bulk_args, gzip-compress, and send to CrateDB
+    /// Accept owned bulk_args, gzip-compress on blocking thread, send to CrateDB.
+    /// CPU work (serialize + gzip) runs on spawn_blocking so tokio I/O threads stay free.
     pub async fn execute_bulk(&self, sql: &str, bulk_args: Vec<Vec<Value>>) -> Result<()> {
         if bulk_args.is_empty() {
             return Ok(());
         }
 
-        let request = SqlRequest {
-            stmt: sql.to_string(),
-            args: None,
-            bulk_args: Some(bulk_args),
-        };
+        // Move CPU-heavy work (JSON serialize + gzip) to blocking thread pool
+        let sql_owned = sql.to_string();
+        let compressed = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let request = SqlRequest {
+                stmt: sql_owned,
+                args: None,
+                bulk_args: Some(bulk_args),
+            };
 
-        // Serialize to JSON then gzip compress (level 1 = fastest)
-        let json_bytes = serde_json::to_vec(&request)
-            .context("Failed to serialize bulk request")?;
+            let json_bytes = serde_json::to_vec(&request)
+                .context("Failed to serialize bulk request")?;
 
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&json_bytes)
-            .context("Failed to gzip compress payload")?;
-        let compressed = encoder.finish()
-            .context("Failed to finish gzip compression")?;
-
-        debug!("Bulk payload: {} bytes JSON -> {} bytes gzip ({:.0}% reduction)",
-               json_bytes.len(), compressed.len(),
-               (1.0 - compressed.len() as f64 / json_bytes.len() as f64) * 100.0);
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&json_bytes)
+                .context("Failed to gzip compress payload")?;
+            encoder.finish()
+                .context("Failed to finish gzip compression")
+        }).await
+            .context("Blocking task panicked")??;
 
         let url = format!("{}/_sql", self.base_url);
         let mut req_builder = self.client

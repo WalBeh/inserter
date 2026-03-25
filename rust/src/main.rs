@@ -178,15 +178,17 @@ async fn run_data_generation(
                         break;
                     }
                     _ = async {
-                        // Generate batch (sync — no async overhead for CPU work)
-                        let batch = generator.generate_batch(batch_size);
+                        // Generate batch + convert to params on blocking thread
+                        // so tokio I/O threads stay free for HTTP requests
+                        let gen = generator.clone();
+                        let params = tokio::task::spawn_blocking(move || {
+                            let batch = gen.generate_batch(batch_size);
+                            batch.into_iter()
+                                .map(|record| record.into_params())
+                                .collect::<Vec<Vec<serde_json::Value>>>()
+                        }).await.expect("batch generation panicked");
 
-                        // Convert to parameters, consuming records (no clones)
-                        let params: Vec<Vec<serde_json::Value>> = batch.into_iter()
-                            .map(|record| record.into_params())
-                            .collect();
-
-                        // Insert batch (owned Vec — no .to_vec() copy)
+                        // Insert batch — serialize+gzip also on blocking thread (inside execute_bulk)
                         match client.execute_bulk(&insert_sql, params).await {
                             Ok(_) => {
                                 monitor.add_records(batch_size);
