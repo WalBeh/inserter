@@ -229,17 +229,31 @@ class RecordGenerator:
 class AsyncCrateClient:
     """Async HTTP client for CrateDB using aiohttp for maximum throughput."""
 
-    def __init__(self, session: aiohttp.ClientSession, base_url: str):
+    def __init__(self, session: aiohttp.ClientSession, base_url: str, compress: bool = True):
         self.session = session
         self.base_url = base_url
         self.sql_url = f"{base_url}/_sql"
+        self.compress = compress
+
+    def _compress(self, data: bytes) -> bytes:
+        """Gzip compress payload for smaller network transfer."""
+        import gzip
+        return gzip.compress(data, compresslevel=1)  # level 1 = fastest, still ~8x ratio on JSON
 
     async def execute_bulk(self, sql: str, bulk_args: List[List]) -> dict:
-        """Execute bulk insert with async HTTP."""
-        payload = {"stmt": sql, "bulk_args": bulk_args}
+        """Execute bulk insert with async HTTP, optionally gzip-compressed."""
+        payload = json.dumps({"stmt": sql, "bulk_args": bulk_args}).encode()
+
+        if self.compress:
+            payload = self._compress(payload)
+            headers = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+        else:
+            headers = {"Content-Type": "application/json"}
+
         async with self.session.post(
             self.sql_url,
-            json=payload,
+            data=payload,
+            headers=headers,
             timeout=aiohttp.ClientTimeout(total=60),
         ) as response:
             response.raise_for_status()
