@@ -166,6 +166,37 @@ This creates fresh TCP connections to test whether the load balancer distributes
 └── README.md
 ```
 
+## How We Fixed Python Performance
+
+The original Python implementation used `threading.Thread` workers with the `requests` library. This had several compounding bottlenecks:
+
+1. **GIL serialization**: Python's Global Interpreter Lock meant only one thread could generate records at a time, even with multiple OS threads. Record generation (~12ms per batch) blocked all other threads.
+2. **Sequential worker loop**: Each thread did generate → HTTP POST → `time.sleep(0.1)` → repeat. Nothing overlapped. With default settings, each thread managed ~500 records/sec.
+3. **Connection pool limits**: `requests.Session()` defaults to 10 connections per host (urllib3 default). Under load, extra requests queued for a connection or triggered new TLS handshakes (~100-200ms each).
+4. **Lock contention**: A `threading.Lock` was acquired on every batch insert to update the performance monitor counters.
+
+The fix was to replace the entire insertion engine with **asyncio + aiohttp**:
+
+- A single event loop runs N async tasks (e.g., 64). While one task awaits the HTTP response from CrateDB, the others are free to generate and send batches. This sidesteps the GIL entirely — there's only one thread, so no contention.
+- `aiohttp.TCPConnector(limit=0)` removes the connection pool cap. Dozens of HTTP requests fly concurrently.
+- The performance monitor no longer needs a lock (single-threaded async = no races).
+- `time.sleep()` was replaced with `asyncio.sleep()` (or removed entirely with `--batch-interval 0`).
+
+**Result**: Python went from ~260 records/sec (1 thread, default settings) to **~17,000 records/sec** (64 async tasks, batch_size 1000, no delay) — within striking distance of the Rust implementation.
+
+### Python vs Rust (same cluster, same settings)
+
+Tested against a single-node CrateDB Cloud cluster with ~150ms network latency:
+
+| | Python (async) | Rust (tokio) |
+|---|---|---|
+| 32 tasks, batch 1000 | ~15,000 rec/sec | ~15,000 rec/sec |
+| 64 tasks, batch 1000 | ~17,000 rec/sec | ~18,000 rec/sec |
+| Memory usage | ~50MB | ~10MB |
+| Errors | 0 | 0 |
+
+At this point the bottleneck is CrateDB ingestion and network latency, not the client. Rust has a small edge due to lower per-request overhead and true parallelism in record generation, but for this I/O-bound workload the difference is marginal.
+
 ## License
 
 MIT
