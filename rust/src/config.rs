@@ -11,10 +11,17 @@ pub struct Config {
     pub batch_interval: u64,
     pub threads: usize,
     pub objects: usize,
+    #[serde(default = "default_shards")]
+    pub shards: usize,
+    #[serde(default = "default_replicas")]
+    pub replicas: usize,
     #[cfg(feature = "dashboard")]
     pub dashboard: bool,
     pub log_level: String,
 }
+
+fn default_shards() -> usize { 4 }
+fn default_replicas() -> usize { 1 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -26,6 +33,8 @@ impl Default for Config {
             batch_interval: 100,
             threads: 1,
             objects: 0,
+            shards: 4,
+            replicas: 1,
             #[cfg(feature = "dashboard")]
             dashboard: false,
             log_level: "info".to_string(),

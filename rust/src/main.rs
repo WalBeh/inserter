@@ -75,6 +75,14 @@ struct Cli {
     /// Benchmark mode: minimal output, JSON result to stdout
     #[arg(long)]
     benchmark: bool,
+
+    /// Number of shards for table creation
+    #[arg(long)]
+    shards: Option<usize>,
+
+    /// Number of replicas for table creation
+    #[arg(long)]
+    replicas: Option<usize>,
 }
 
 fn sanitize_connection_string(connection_string: &str) -> String {
@@ -92,7 +100,7 @@ fn sanitize_connection_string(connection_string: &str) -> String {
 
 
 
-async fn create_table(client: &CrateClient, table_name: &str, objects: usize) -> Result<()> {
+async fn create_table(client: &CrateClient, table_name: &str, objects: usize, shards: usize, replicas: usize) -> Result<()> {
     let mut columns = vec![
         "id TEXT PRIMARY KEY".to_string(),
         "timestamp TIMESTAMP WITH TIME ZONE".to_string(),
@@ -112,9 +120,11 @@ async fn create_table(client: &CrateClient, table_name: &str, objects: usize) ->
     }
 
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {} ({}) WITH (number_of_replicas = 1)",
+        "CREATE TABLE IF NOT EXISTS {} ({}) CLUSTERED INTO {} SHARDS WITH (number_of_replicas = {})",
         table_name,
-        columns.join(", ")
+        columns.join(", "),
+        shards,
+        replicas
     );
 
     info!("Creating table: {}", table_name);
@@ -164,7 +174,7 @@ async fn run_data_generation(
     let table_name = config.table_name.as_ref().unwrap();
 
     // Create table
-    create_table(&client, table_name, config.objects).await?;
+    create_table(&client, table_name, config.objects, config.shards, config.replicas).await?;
 
     // Query cluster info
     let cluster_info = query_cluster_info(&client).await;
@@ -772,6 +782,12 @@ async fn main() -> Result<()> {
     }
     if let Some(objects) = cli.objects {
         config.objects = objects;
+    }
+    if let Some(shards) = cli.shards {
+        config.shards = shards;
+    }
+    if let Some(replicas) = cli.replicas {
+        config.replicas = replicas;
     }
 
     // Validate configuration

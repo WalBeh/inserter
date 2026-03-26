@@ -450,6 +450,8 @@ async def run_async_engine(
     num_tasks: int,
     objects: int,
     benchmark: bool = False,
+    shards: int = 4,
+    replicas: int = 1,
 ):
     """Main async engine: creates aiohttp session, spawns workers, runs for duration."""
 
@@ -497,7 +499,7 @@ async def run_async_engine(
 
         # Create table (reuse sync client for setup)
         setup_client = CrateDBClient(connection_string)
-        create_table(setup_client, table_name, objects)
+        create_table(setup_client, table_name, objects, shards=shards, replicas=replicas)
 
         # Prepare insert SQL
         base_fields = "id, timestamp, region, product_category, event_type, user_id, user_segment, amount, quantity, metadata"
@@ -1152,7 +1154,7 @@ def sample_load_balancer(connection_string: str, samples: int = None) -> Dict[st
     return node_counts
 
 
-def create_table(client: CrateDBClient, table_name: str, num_objects: int = 0) -> None:
+def create_table(client: CrateDBClient, table_name: str, num_objects: int = 0, shards: int = 4, replicas: int = 1) -> None:
     """Create the target table in CrateDB."""
 
     # Base table definition
@@ -1176,9 +1178,9 @@ def create_table(client: CrateDBClient, table_name: str, num_objects: int = 0) -
 
     create_sql = f"""
     CREATE TABLE IF NOT EXISTS {table_name} ({base_columns}{object_columns}
-    ) WITH (
-        number_of_replicas = 1
-        -- "refresh_interval" = 1000
+    ) CLUSTERED INTO {shards} SHARDS
+    WITH (
+        number_of_replicas = {replicas}
     )
     """
 
@@ -1308,9 +1310,21 @@ def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event, nu
     is_flag=True,
     help="Benchmark mode: minimal output during run, JSON result to stdout"
 )
+@click.option(
+    "--shards",
+    type=int,
+    default=4,
+    help="Number of shards for table creation (default: 4)"
+)
+@click.option(
+    "--replicas",
+    type=int,
+    default=1,
+    help="Number of replicas for table creation (default: 1)"
+)
 def cli(table_name: Optional[str], connection_string: Optional[str], duration: Optional[int],
         batch_size: int, batch_interval: float, threads: int, objects: int, test_loadbalancer: bool,
-        benchmark: bool):
+        benchmark: bool, shards: int, replicas: int):
     """
     Generate and insert random records into CrateDB for testing purposes.
 
@@ -1390,6 +1404,8 @@ def cli(table_name: Optional[str], connection_string: Optional[str], duration: O
             num_tasks=threads,
             objects=objects,
             benchmark=benchmark,
+            shards=shards,
+            replicas=replicas,
         ))
     except KeyboardInterrupt:
         logger.warning("Interrupted")
