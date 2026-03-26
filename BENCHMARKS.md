@@ -1,66 +1,79 @@
 # Benchmark Results
 
-## Cluster: xdemo2 (3-node CrateDB Cloud, EC2, 2TiB gp3 EBS)
+All tests use `--benchmark` mode with gzip compression unless noted. CrateDB Cloud on AWS (us-east-1).
 
-Tested 2026-03-25 from a MacBook over the internet (~150ms latency to us-east-1).
+## Localhost: 32-vCPU single node (CrateDB 6.2.2, 125GB RAM)
 
-### Python (asyncio + aiohttp, gzip level 1)
+Client and CrateDB on the same machine. No network overhead. `--no-compression` used (gzip wastes CPU on localhost).
 
-| Tasks | Batch Size | Avg rec/sec | Total (60s) | Errors |
-|-------|-----------|-------------|-------------|--------|
-| 32 | 1000 | 22,869 | 1,373,000 | 3 |
-| **64** | **1000** | **32,895** | **1,974,000** | **5** |
-| 64 | 2000 | 29,628 | 1,778,000 | 2 |
-| 128 | 1000 | ~31,000 | ~1,860,000 | — |
+### Rust (tokio + reqwest, spawn_blocking, no compression)
 
-Sweet spot: **64 tasks, batch_size 1000** — 32,895 rec/sec.
+| Threads | Batch | Shards | Replicas | Avg rec/sec | Per CPU | Rejected | Errors |
+|---------|-------|--------|----------|-------------|---------|----------|--------|
+| 128 | 2000 | 4 | 1 | **214,209** | 6,694 | 0 | 15 |
+| **128** | **15000** | **32** | **1** | **225,150** | **7,036** | **1,806,910** | **82** |
+| 128 | 2000 | 32 | 0 | ~214,000 | ~6,700 | 0 | 0 |
 
-Batch_size 2000 is slower than 1000 because gzip + JSON serialization of larger payloads blocks the single-threaded event loop longer between I/O yields. 128 tasks adds scheduling overhead without enough I/O benefit.
+Best clean run: **214K rec/sec** (128 threads, batch 2000, 4 shards, replicas=1). Batch 15000 pushes higher but causes 1.8M rejected writes — cluster overloaded.
 
-### Rust (tokio + reqwest, gzip flate2::fast)
+### Python (asyncio + aiohttp + orjson, no compression)
 
-#### Before: CPU work on tokio threads (v1)
+| Tasks | Batch | Shards | Replicas | Avg rec/sec | Per CPU | Errors |
+|-------|-------|--------|----------|-------------|---------|--------|
+| 128 | 1000 | 32 | 0 | **76,350** | 2,386 | 0 |
+| 128 | 1000 | 4 | 1 | 63,719 | 1,991 | 0 |
+| 128 | 100 | 4 | 1 | 47,421 | 1,482 | 10 |
 
-| Threads | Batch Size | Avg rec/sec | Total (60s) | Errors |
-|---------|-----------|-------------|-------------|--------|
-| 32 | 1000 | 24,498 | 1,497,000 | 0 |
-| 64 | 1000 | 18,424 | 1,124,000 | 0 |
-| 64 | 2000 | 25,031 | 1,532,000 | 0 |
+Python is single-core CPU-bound (GIL): one core at 100%, the other 31 idle. `json.dumps` → `orjson.dumps` gave +17%. To match Rust, run multiple Python processes in parallel.
 
-Rust v1 *slowed down* at 64 threads because record generation + JSON serialization + gzip ran synchronously inside async tasks, blocking the tokio worker thread pool.
+## Remote: 3-node cluster (xdemo2, cr2, 4 vCPU/node, 12 total)
 
-#### After: CPU work on spawn_blocking (v2)
+### From Hetzner Frankfurt (~180ms RTT, gzip on)
 
-| Threads | Batch Size | Avg rec/sec | Total (60s) | Errors |
-|---------|-----------|-------------|-------------|--------|
-| 32 | 1000 | 31,105 | 1,903,000 | 0 |
-| 64 | 1000 | 30,691 | 1,870,000 | 0 |
-| **128** | **1000** | **33,565** | **2,042,000** | **0** |
+| Client | Tasks | Batch | Shards | Replicas | Avg rec/sec | Per CPU | Bandwidth | Errors |
+|--------|-------|-------|--------|----------|-------------|---------|-----------|--------|
+| Python | 64 | 1200 | **12** | 1 | **49,837** | 4,153 | 30 Mbps | 0 |
+| Python | 64 | 1200 | 4 | 1 | 32,006 | 2,667 | 19.5 Mbps | 0 |
+| Python | 64 | 1200 | 12 | 0 | 32,566 | 2,714 | 19.5 Mbps | 0 |
 
-Moving CPU work to `spawn_blocking` freed the tokio I/O threads. Rust now scales with concurrency: **+67% at 64 threads** (18K → 31K), and 128 threads hits **33,565 rec/sec**.
+12 shards gave +56% over 4 shards. Bandwidth fluctuates on shared Hetzner networking (19-30 Mbps).
 
-### Comparison (best config each)
+### From Hetzner Ashburn (~40ms RTT, gzip on)
 
-| | Python | Rust | Delta |
-|---|---|---|---|
-| Best config | 64 tasks / 1000 batch | 128 threads / 1000 batch | |
-| **Throughput** | **32,895 rec/sec** | **33,565 rec/sec** | Rust +2% |
-| Errors | 5 | 0 | Rust cleaner |
-| Records (60s) | 1,974,000 | 2,042,000 | |
+| Client | Tasks | Batch | Shards | Replicas | Avg rec/sec | Per CPU | Bandwidth | Errors |
+|--------|-------|-------|--------|----------|-------------|---------|-----------|--------|
+| Python | 64 | 1200 | 12 | 1 | 25,596 | 2,133 | 13.9 Mbps | 0 |
+| Python | 64 | 1000 | 12 | 1 | 20,342 | 1,695 | 12.2 Mbps | 0 |
 
-### Previous cluster: xdemo (1-node CrateDB Cloud)
+Lower RTT but capped at ~14 Mbps — Hetzner Ashburn → AWS cross-cloud peering bottleneck.
 
-| | Python | Rust |
-|---|---|---|
-| 32 tasks, batch 1000 | ~15,000 rec/sec | ~15,000 rec/sec |
-| 64 tasks, batch 1000 | ~17,000 rec/sec | ~18,000 rec/sec |
+### From MacBook (~150ms RTT, ~30 Mbps uplink, gzip on)
 
-On a single node both were bottlenecked by CrateDB ingestion, so performance was similar.
+| Client | Tasks | Batch | Shards | Avg rec/sec | Per CPU | Bandwidth | Errors |
+|--------|-------|-------|--------|-------------|---------|-----------|--------|
+| Python | 64 | 1000 | 4 | 32,895 | 2,741 | 28.6 Mbps | 5 |
+| Rust | 128 | 1000 | 4 | 33,565 | 2,797 | 26.0 Mbps | 0 |
+| Rust | 32 | 1000 | 4 | 24,498 | 2,041 | — | 0 |
+
+Both saturate the laptop uplink at ~28-30 Mbps.
+
+## Remote: 5-node cluster (xdemo2 scaled, cr2, 4 vCPU/node, 20 total)
+
+### From Hetzner Frankfurt (~180ms RTT, gzip on)
+
+| Client | Tasks | Batch | Shards | Replicas | Avg rec/sec | Per CPU | Bandwidth | Errors |
+|--------|-------|-------|--------|----------|-------------|---------|-----------|--------|
+| Rust | 64 | 2000 | 4 | 1 | 52,426 | 2,621 | 39.3 Mbps | 0 |
+
+Again bandwidth-limited at ~39 Mbps.
 
 ## Key Observations
 
-1. **Both implementations now perform equally** at ~33K rec/sec against the 3-node cluster.
-2. **Rust's initial scaling problem was fixed** by moving CPU work (record generation, JSON serialization, gzip) to `spawn_blocking`, keeping tokio I/O threads free for HTTP multiplexing.
-3. **Batch size 1000 is the sweet spot** for both. Larger batches increase per-request CPU time (serialization + compression) without proportional network savings.
-4. **The 3-node cluster can absorb ~33K rec/sec** from a single client over the internet. The bottleneck is now CrateDB ingestion, not the client.
-5. **Rust has zero errors** across all runs. Python had a few transient failures (3-5 per run) likely from connection churn under high concurrency.
+1. **On localhost, Rust is 3x faster than Python** (214K vs 76K) because Rust parallelizes CPU work across cores via `spawn_blocking`, while Python is single-core GIL-bound.
+2. **Over the network, both perform equally** — the bottleneck is bandwidth and latency, not client CPU.
+3. **Shards matter**: 12 shards on 3 nodes gave +56% over 4 shards (Frankfurt test).
+4. **Batch size 15,000 overloads a single node** — 1.8M rejected writes. Batch 1000-2000 is safer.
+5. **Gzip compression**: essential over the network (~88% payload reduction), counterproductive on localhost (wastes single-core CPU).
+6. **`orjson` vs `json.dumps`**: +17% for Python on localhost. Marginal over the network.
+7. **Rejected writes** (`sys.nodes` thread pool query) are the key health indicator — any > 0 means the cluster is overloaded.
+8. **Network bandwidth is almost always the bottleneck** from remote clients. From the same cloud region, expect much higher throughput.
