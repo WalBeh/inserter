@@ -281,6 +281,7 @@ class AsyncPerformanceMonitor:
         self.errors = 0
         self.last_report_time = time.monotonic()
         self.last_report_records = 0
+        self.rate_samples: List[float] = []
 
     def add_records(self, count: int):
         self.total_records += count
@@ -298,6 +299,7 @@ class AsyncPerformanceMonitor:
         rate = records_diff / time_diff
         self.last_report_time = now
         self.last_report_records = self.total_records
+        self.rate_samples.append(rate)
         return rate
 
     def get_overall_stats(self) -> Dict[str, Any]:
@@ -308,6 +310,20 @@ class AsyncPerformanceMonitor:
             "elapsed_time": elapsed,
             "overall_rate": self.total_records / elapsed if elapsed > 0 else 0,
             "errors": self.errors,
+        }
+
+    def get_percentile_stats(self) -> Dict[str, float]:
+        """Compute min/max/avg/p90/p95 from collected rate samples."""
+        if not self.rate_samples:
+            return {"avg": 0, "min": 0, "max": 0, "p90": 0, "p95": 0}
+        s = sorted(self.rate_samples)
+        n = len(s)
+        return {
+            "avg": round(sum(s) / n, 1),
+            "min": round(s[0], 1),
+            "max": round(s[-1], 1),
+            "p90": round(s[int(n * 0.9)] if n > 1 else s[0], 1),
+            "p95": round(s[int(n * 0.95)] if n > 1 else s[0], 1),
         }
 
 
@@ -341,23 +357,49 @@ async def async_worker(
             await asyncio.sleep(min(5.0, 1.0))
 
 
-async def async_reporter(monitor: AsyncPerformanceMonitor, stop_event: asyncio.Event, num_tasks: int):
-    """Report performance every 10 seconds."""
+async def async_reporter(monitor: AsyncPerformanceMonitor, stop_event: asyncio.Event, num_tasks: int, quiet: bool = False):
+    """Report performance every 10 seconds. In quiet mode, collect samples silently."""
     while not stop_event.is_set():
         try:
             await asyncio.sleep(10)
         except asyncio.CancelledError:
             break
         rate = monitor.get_current_rate()
-        stats = monitor.get_overall_stats()
-        logger.info(
-            f"Performance: {rate:.1f} records/sec (current), "
-            f"{stats['overall_rate']:.1f} records/sec (avg), "
-            f"Total: {stats['total_records']:,} records, "
-            f"Batches: {stats['total_batches']:,}, "
-            f"Tasks: {num_tasks}, "
-            f"Errors: {stats['errors']}"
-        )
+        if not quiet:
+            stats = monitor.get_overall_stats()
+            logger.info(
+                f"Performance: {rate:.1f} records/sec (current), "
+                f"{stats['overall_rate']:.1f} records/sec (avg), "
+                f"Total: {stats['total_records']:,} records, "
+                f"Batches: {stats['total_batches']:,}, "
+                f"Tasks: {num_tasks}, "
+                f"Errors: {stats['errors']}"
+            )
+
+
+async def query_cluster_info(client: AsyncCrateClient) -> Dict[str, Any]:
+    """Query CrateDB sys tables for cluster hardware/version info."""
+    info: Dict[str, Any] = {}
+    try:
+        r = await client.execute("SELECT os_info['available_processors'] FROM sys.nodes")
+        cpus = [row[0] for row in r.get("rows", [])]
+        info["cpus_per_node"] = cpus
+        info["total_cpus"] = sum(cpus)
+        info["nodes"] = len(cpus)
+
+        r = await client.execute("SELECT mem['used'] FROM sys.nodes")
+        info["memory_used_bytes"] = [row[0] for row in r.get("rows", [])]
+
+        r = await client.execute("SELECT fs['total']['size'] FROM sys.nodes")
+        info["disk_total_bytes"] = [row[0] for row in r.get("rows", [])]
+
+        r = await client.execute("SELECT heap['max'], version['number'] FROM sys.nodes LIMIT 1")
+        if r.get("rows"):
+            info["heap_max_bytes"] = r["rows"][0][0]
+            info["version"] = r["rows"][0][1]
+    except Exception as e:
+        logger.warning(f"Failed to query cluster info: {e}")
+    return info
 
 
 async def run_async_engine(
@@ -368,19 +410,21 @@ async def run_async_engine(
     batch_interval: float,
     num_tasks: int,
     objects: int,
+    benchmark: bool = False,
 ):
     """Main async engine: creates aiohttp session, spawns workers, runs for duration."""
 
-    # Run load balancer distribution test before starting workers
-    logger.info("Running load balancer distribution test...")
-    lb_distribution = sample_load_balancer_5tuple(connection_string)
-    if lb_distribution:
-        node_summary = []
-        total_samples = sum(lb_distribution.values())
-        for node, count in sorted(lb_distribution.items()):
-            pct = (count / total_samples) * 100 if total_samples > 0 else 0
-            node_summary.append(f"{node}={count} ({pct:.1f}%)")
-        logger.info(f"Load balancer distribution: {', '.join(node_summary)}")
+    # Skip LB test in benchmark mode
+    if not benchmark:
+        logger.info("Running load balancer distribution test...")
+        lb_distribution = sample_load_balancer_5tuple(connection_string)
+        if lb_distribution:
+            node_summary = []
+            total_samples = sum(lb_distribution.values())
+            for node, count in sorted(lb_distribution.items()):
+                pct = (count / total_samples) * 100 if total_samples > 0 else 0
+                node_summary.append(f"{node}={count} ({pct:.1f}%)")
+            logger.info(f"Load balancer distribution: {', '.join(node_summary)}")
 
     parsed = urlparse(connection_string)
     base_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 4200}"
@@ -431,9 +475,21 @@ async def run_async_engine(
         monitor = AsyncPerformanceMonitor()
         stop_event = asyncio.Event()
 
+        # Query cluster info (needed for benchmark JSON)
+        cluster_info = await query_cluster_info(client)
+
+        # Get pre-existing record count for verification
+        pre_count = 0
+        try:
+            r = await client.execute(f"REFRESH TABLE {table_name}")
+            r = await client.execute(f"SELECT COUNT(*) FROM {table_name}")
+            pre_count = r.get("rows", [[0]])[0][0]
+        except Exception:
+            pass
+
         # Spawn reporter
         reporter_task = asyncio.create_task(
-            async_reporter(monitor, stop_event, num_tasks)
+            async_reporter(monitor, stop_event, num_tasks, quiet=benchmark)
         )
 
         # Spawn workers
@@ -464,48 +520,80 @@ async def run_async_engine(
         except asyncio.CancelledError:
             pass
 
+        # Collect one final rate sample
+        monitor.get_current_rate()
+
         # Final stats
         final_stats = monitor.get_overall_stats()
-        logger.info("=" * 60)
-        logger.info("FINAL PERFORMANCE SUMMARY")
-        logger.info("=" * 60)
-        logger.success(f"Async worker tasks: {num_tasks}")
-        logger.success(f"Total records sent: {final_stats['total_records']:,}")
-        logger.success(f"Total batches: {final_stats['total_batches']:,}")
-        logger.success(f"Total runtime: {final_stats['elapsed_time']:.1f} seconds")
-        logger.success(f"Average insertion rate: {final_stats['overall_rate']:.1f} records/second")
-        logger.success(f"Records per task: {final_stats['total_records'] // max(num_tasks, 1):,} avg")
-        logger.success(f"Total errors: {final_stats['errors']}")
-        logger.info("=" * 60)
 
         # Verify records in CrateDB
-        logger.info("Verifying record count in CrateDB...")
+        verified_count = 0
         try:
             await client.execute(f"REFRESH TABLE {table_name}")
             result = await client.execute(f"SELECT COUNT(*) FROM {table_name}")
             db_count = result.get("rows", [[0]])[0][0]
-            sent = final_stats["total_records"]
-
-            logger.info("=" * 60)
-            logger.info("RECORD VERIFICATION")
-            logger.info("=" * 60)
-            logger.info(f"Records sent by client: {sent:,}")
-            logger.info(f"Records in CrateDB:     {db_count:,}")
-            if db_count == sent:
-                logger.success("MATCH - all records accounted for")
-            elif db_count > sent:
-                logger.info(f"CrateDB has {db_count - sent:,} more records (table had pre-existing data)")
-            else:
-                missing = sent - db_count
-                loss_pct = (missing / sent) * 100 if sent > 0 else 0
-                logger.warning(f"MISMATCH - {missing:,} records missing ({loss_pct:.2f}% loss)")
-            logger.info("=" * 60)
+            verified_count = db_count - pre_count
         except Exception as e:
             logger.warning(f"Failed to verify record count: {e}")
 
-        if final_stats["errors"] > 0:
-            error_rate = (final_stats["errors"] / max(final_stats["total_batches"], 1)) * 100
-            logger.warning(f"Error rate: {error_rate:.2f}%")
+        if benchmark:
+            # Benchmark mode: output single-line JSON to stdout
+            rate_stats = monitor.get_percentile_stats()
+            total_cpus = cluster_info.get("total_cpus", 1)
+            per_cpu = {k: round(v / total_cpus, 1) for k, v in rate_stats.items()}
+
+            benchmark_result = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "client": "python-http",
+                "cluster": cluster_info,
+                "config": {
+                    "threads": num_tasks,
+                    "batch_size": batch_size,
+                    "batch_interval": batch_interval,
+                    "duration_minutes": duration,
+                    "table_name": table_name,
+                },
+                "results": {
+                    "total_records": final_stats["total_records"],
+                    "total_batches": final_stats["total_batches"],
+                    "runtime_seconds": round(final_stats["elapsed_time"], 1),
+                    "errors": final_stats["errors"],
+                    "records_per_second": rate_stats,
+                    "records_per_cpu_second": per_cpu,
+                    "verified_count": verified_count,
+                },
+            }
+            # JSONL to stdout (one line, appendable)
+            print(json.dumps(benchmark_result, separators=(",", ":")))
+        else:
+            # Normal mode: human-readable output
+            sent = final_stats["total_records"]
+            logger.info("=" * 60)
+            logger.info("FINAL PERFORMANCE SUMMARY")
+            logger.info("=" * 60)
+            logger.success(f"Async worker tasks: {num_tasks}")
+            logger.success(f"Total records sent: {sent:,}")
+            logger.success(f"Total batches: {final_stats['total_batches']:,}")
+            logger.success(f"Total runtime: {final_stats['elapsed_time']:.1f} seconds")
+            logger.success(f"Average insertion rate: {final_stats['overall_rate']:.1f} records/second")
+            logger.success(f"Records per task: {sent // max(num_tasks, 1):,} avg")
+            logger.success(f"Total errors: {final_stats['errors']}")
+            logger.info("=" * 60)
+
+            logger.info("RECORD VERIFICATION")
+            logger.info(f"Records sent: {sent:,}  |  Verified in CrateDB: {verified_count:,}")
+            if verified_count == sent:
+                logger.success("MATCH")
+            elif verified_count > sent:
+                logger.info(f"CrateDB has {verified_count - sent:,} extra (pre-existing data)")
+            else:
+                missing = sent - verified_count
+                logger.warning(f"MISMATCH - {missing:,} missing ({(missing/sent)*100:.2f}% loss)")
+            logger.info("=" * 60)
+
+            if final_stats["errors"] > 0:
+                error_rate = (final_stats["errors"] / max(final_stats["total_batches"], 1)) * 100
+                logger.warning(f"Error rate: {error_rate:.2f}%")
 
 
 def make_fresh_request(connection_string: str) -> Tuple[Dict, str, int, Dict]:
@@ -1171,8 +1259,14 @@ def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event, nu
     is_flag=True,
     help="Run only the 5-tuple load balancer test (no table creation or data insertion)"
 )
+@click.option(
+    "--benchmark",
+    is_flag=True,
+    help="Benchmark mode: minimal output during run, JSON result to stdout"
+)
 def cli(table_name: Optional[str], connection_string: Optional[str], duration: Optional[int],
-        batch_size: int, batch_interval: float, threads: int, objects: int, test_loadbalancer: bool):
+        batch_size: int, batch_interval: float, threads: int, objects: int, test_loadbalancer: bool,
+        benchmark: bool):
     """
     Generate and insert random records into CrateDB for testing purposes.
 
@@ -1236,6 +1330,12 @@ def cli(table_name: Optional[str], connection_string: Optional[str], duration: O
     if objects > 0:
         logger.info(f"Object columns: {objects}")
 
+    if benchmark:
+        # In benchmark mode, suppress loguru output (logs go to stderr anyway)
+        logger.remove()
+        logger.add(sys.stderr, level="WARNING",
+                   format="<level>{level: <8}</level> | <cyan>{message}</cyan>")
+
     try:
         asyncio.run(run_async_engine(
             connection_string=connection_string,
@@ -1245,6 +1345,7 @@ def cli(table_name: Optional[str], connection_string: Optional[str], duration: O
             batch_interval=batch_interval,
             num_tasks=threads,
             objects=objects,
+            benchmark=benchmark,
         ))
     except KeyboardInterrupt:
         logger.warning("Interrupted")

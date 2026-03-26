@@ -71,6 +71,10 @@ struct Cli {
     /// Run only the 5-tuple load balancer test (no table creation or data insertion)
     #[arg(long)]
     test_loadbalancer: bool,
+
+    /// Benchmark mode: minimal output, JSON result to stdout
+    #[arg(long)]
+    benchmark: bool,
 }
 
 fn sanitize_connection_string(connection_string: &str) -> String {
@@ -121,15 +125,58 @@ async fn create_table(client: &CrateClient, table_name: &str, objects: usize) ->
     Ok(())
 }
 
+async fn query_cluster_info(client: &CrateClient) -> serde_json::Value {
+    let mut info = serde_json::json!({});
+
+    if let Ok(rows) = client.execute_query("SELECT os_info['available_processors'] FROM sys.nodes").await {
+        let cpus: Vec<u64> = rows.iter().filter_map(|r| r.first().and_then(|v| v.as_u64())).collect();
+        info["cpus_per_node"] = serde_json::json!(cpus);
+        info["total_cpus"] = serde_json::json!(cpus.iter().sum::<u64>());
+        info["nodes"] = serde_json::json!(cpus.len());
+    }
+    if let Ok(rows) = client.execute_query("SELECT mem['used'] FROM sys.nodes").await {
+        let mem: Vec<u64> = rows.iter().filter_map(|r| r.first().and_then(|v| v.as_u64())).collect();
+        info["memory_used_bytes"] = serde_json::json!(mem);
+    }
+    if let Ok(rows) = client.execute_query("SELECT fs['total']['size'] FROM sys.nodes").await {
+        let disk: Vec<u64> = rows.iter().filter_map(|r| r.first().and_then(|v| v.as_u64())).collect();
+        info["disk_total_bytes"] = serde_json::json!(disk);
+    }
+    if let Ok(rows) = client.execute_query("SELECT heap['max'], version['number'] FROM sys.nodes LIMIT 1").await {
+        if let Some(row) = rows.first() {
+            if let Some(heap) = row.first().and_then(|v| v.as_u64()) {
+                info["heap_max_bytes"] = serde_json::json!(heap);
+            }
+            if let Some(ver) = row.get(1).and_then(|v| v.as_str()) {
+                info["version"] = serde_json::json!(ver);
+            }
+        }
+    }
+    info
+}
+
 async fn run_data_generation(
     client: CrateClient,
     config: Config,
     monitor: PerformanceMonitor,
+    benchmark: bool,
 ) -> Result<()> {
     let table_name = config.table_name.as_ref().unwrap();
 
     // Create table
     create_table(&client, table_name, config.objects).await?;
+
+    // Query cluster info
+    let cluster_info = query_cluster_info(&client).await;
+
+    // Get pre-existing record count
+    let pre_count = {
+        let _ = client.execute(&format!("REFRESH TABLE {}", table_name), &[]).await;
+        client.execute_query(&format!("SELECT COUNT(*) FROM {}", table_name)).await
+            .ok()
+            .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64())))
+            .unwrap_or(0)
+    };
 
     // Prepare insert statement
     let mut placeholders = vec!["?"; 10]; // Base fields
@@ -211,9 +258,11 @@ async fn run_data_generation(
         tasks.push(task);
     }
 
-    // Spawn reporting task
+    // Spawn reporting task (collects rate samples; logs only in non-benchmark mode)
     let monitor_clone = monitor.clone();
     let shutdown_tx_clone = shutdown_tx.clone();
+    let benchmark_mode = benchmark;
+    let num_threads = config.threads;
     let reporting_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         let mut shutdown_rx = shutdown_tx_clone.subscribe();
@@ -223,15 +272,17 @@ async fn run_data_generation(
                 _ = shutdown_rx.recv() => break,
                 _ = interval.tick() => {
                     let stats = monitor_clone.get_current_stats().await;
-                    info!(
-                        "Performance: {:.1} records/sec (current), {:.1} records/sec (avg), Total: {} records, Batches: {}, Threads: {}, Errors: {}",
-                        stats.current_rate,
-                        stats.average_rate,
-                        stats.total_records,
-                        stats.total_batches,
-                        config.threads,
-                        stats.total_errors
-                    );
+                    if !benchmark_mode {
+                        info!(
+                            "Performance: {:.1} records/sec (current), {:.1} records/sec (avg), Total: {} records, Batches: {}, Threads: {}, Errors: {}",
+                            stats.current_rate,
+                            stats.average_rate,
+                            stats.total_records,
+                            stats.total_batches,
+                            num_threads,
+                            stats.total_errors
+                        );
+                    }
                 }
             }
         }
@@ -259,55 +310,81 @@ async fn run_data_generation(
     }
     let _ = reporting_task.await;
 
+    // Collect one final rate sample
+    let _ = monitor.get_current_stats().await;
+
     // Final statistics
     let final_stats = monitor.get_final_stats_async().await;
-    info!("{}", "=".repeat(60));
-    info!("FINAL PERFORMANCE SUMMARY");
-    info!("{}", "=".repeat(60));
-    info!("✅ Worker threads: {}", config.threads);
-    info!("✅ Total records sent: {}", final_stats.total_records);
-    info!("✅ Total batches: {}", final_stats.total_batches);
-    info!("✅ Total runtime: {:.1} seconds", final_stats.runtime_seconds);
-    info!("✅ Average insertion rate: {:.1} records/second", final_stats.average_rate);
-    info!("✅ Records per thread: {:.0} avg", final_stats.total_records as f64 / config.threads as f64);
-    info!("✅ Total errors: {}", final_stats.total_errors);
-    info!("{}", "=".repeat(60));
 
-    // Verify records in CrateDB match what we sent
-    info!("Verifying record count in CrateDB...");
+    // Verify records
+    let verified_count = {
+        let _ = client.execute(&format!("REFRESH TABLE {}", table_name), &[]).await;
+        let post_count = client.execute_query(&format!("SELECT COUNT(*) FROM {}", table_name)).await
+            .ok()
+            .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64())))
+            .unwrap_or(0);
+        post_count.saturating_sub(pre_count)
+    };
 
-    // Refresh the table to ensure all records are visible
-    let refresh_sql = format!("REFRESH TABLE {}", table_name);
-    if let Err(e) = client.execute(&refresh_sql, &[]).await {
-        warn!("Failed to refresh table: {}", e);
-    }
+    if benchmark {
+        // Benchmark mode: JSONL to stdout
+        let rate_stats = monitor.get_percentile_stats().await;
+        let total_cpus = cluster_info.get("total_cpus").and_then(|v| v.as_u64()).unwrap_or(1) as f64;
+        let per_cpu = serde_json::json!({
+            "avg": (rate_stats.avg / total_cpus * 10.0).round() / 10.0,
+            "min": (rate_stats.min / total_cpus * 10.0).round() / 10.0,
+            "max": (rate_stats.max / total_cpus * 10.0).round() / 10.0,
+            "p90": (rate_stats.p90 / total_cpus * 10.0).round() / 10.0,
+            "p95": (rate_stats.p95 / total_cpus * 10.0).round() / 10.0,
+        });
 
-    let count_sql = format!("SELECT COUNT(*) FROM {}", table_name);
-    match client.execute_query(&count_sql).await {
-        Ok(rows) => {
-            if let Some(count) = rows.first().and_then(|r| r.first()).and_then(|v| v.as_u64()) {
-                let sent = final_stats.total_records;
-                info!("{}", "=".repeat(60));
-                info!("RECORD VERIFICATION");
-                info!("{}", "=".repeat(60));
-                info!("Records sent by client: {}", sent);
-                info!("Records in CrateDB:     {}", count);
-                if count == sent {
-                    info!("✅ MATCH - all records accounted for");
-                } else if count > sent {
-                    info!("ℹ️  CrateDB has {} more records (table had pre-existing data)", count - sent);
-                } else {
-                    let missing = sent - count;
-                    let loss_pct = (missing as f64 / sent as f64) * 100.0;
-                    warn!("⚠️  MISMATCH - {} records missing ({:.2}% loss)", missing, loss_pct);
-                    warn!("   Possible causes: bulk insert partial failures, replication lag");
-                }
-                info!("{}", "=".repeat(60));
+        let result = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "client": "rust-http",
+            "cluster": cluster_info,
+            "config": {
+                "threads": config.threads,
+                "batch_size": config.batch_size,
+                "batch_interval": config.batch_interval,
+                "duration_minutes": config.duration.unwrap(),
+                "table_name": table_name,
+            },
+            "results": {
+                "total_records": final_stats.total_records,
+                "total_batches": final_stats.total_batches,
+                "runtime_seconds": (final_stats.runtime_seconds * 10.0).round() / 10.0,
+                "errors": final_stats.total_errors,
+                "records_per_second": rate_stats,
+                "records_per_cpu_second": per_cpu,
+                "verified_count": verified_count,
             }
+        });
+        println!("{}", serde_json::to_string(&result).unwrap());
+    } else {
+        // Normal mode
+        info!("{}", "=".repeat(60));
+        info!("FINAL PERFORMANCE SUMMARY");
+        info!("{}", "=".repeat(60));
+        info!("✅ Worker threads: {}", config.threads);
+        info!("✅ Total records sent: {}", final_stats.total_records);
+        info!("✅ Total batches: {}", final_stats.total_batches);
+        info!("✅ Total runtime: {:.1} seconds", final_stats.runtime_seconds);
+        info!("✅ Average insertion rate: {:.1} records/second", final_stats.average_rate);
+        info!("✅ Records per thread: {:.0} avg", final_stats.total_records as f64 / config.threads as f64);
+        info!("✅ Total errors: {}", final_stats.total_errors);
+        info!("{}", "=".repeat(60));
+
+        info!("RECORD VERIFICATION");
+        info!("Records sent: {}  |  Verified in CrateDB: {}", final_stats.total_records, verified_count);
+        if verified_count == final_stats.total_records {
+            info!("✅ MATCH");
+        } else if verified_count > final_stats.total_records {
+            info!("ℹ️  CrateDB has {} extra (pre-existing data)", verified_count - final_stats.total_records);
+        } else {
+            let missing = final_stats.total_records - verified_count;
+            warn!("⚠️  MISMATCH - {} missing ({:.2}% loss)", missing, (missing as f64 / final_stats.total_records as f64) * 100.0);
         }
-        Err(e) => {
-            warn!("Failed to verify record count: {}", e);
-        }
+        info!("{}", "=".repeat(60));
     }
 
     Ok(())
@@ -595,9 +672,10 @@ async fn main() -> Result<()> {
     // Parse CLI arguments AFTER environment variables are loaded
     let cli = Cli::parse();
 
-    // Initialize logging
+    // Initialize logging (suppress in benchmark mode)
+    let effective_log_level = if cli.benchmark { "warn".to_string() } else { cli.log_level.clone() };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&effective_log_level));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -698,7 +776,7 @@ async fn main() -> Result<()> {
     let monitor = PerformanceMonitor::new();
 
     // Run data generation
-    run_data_generation(client, config, monitor).await?;
+    run_data_generation(client, config, monitor, cli.benchmark).await?;
 
     Ok(())
 }

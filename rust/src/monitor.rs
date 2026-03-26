@@ -14,11 +14,21 @@ pub struct PerformanceStats {
     pub runtime_seconds: f64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PercentileStats {
+    pub avg: f64,
+    pub min: f64,
+    pub max: f64,
+    pub p90: f64,
+    pub p95: f64,
+}
+
 /// Time-tracking state that needs a lock (read infrequently)
 struct TimingState {
     start_time: Instant,
     last_report_time: Instant,
     last_report_records: u64,
+    rate_samples: Vec<f64>,
 }
 
 /// Lock-free counters for the hot path
@@ -48,6 +58,7 @@ impl PerformanceMonitor {
                 start_time: now,
                 last_report_time: now,
                 last_report_records: 0,
+                rate_samples: Vec::new(),
             })),
         }
     }
@@ -90,6 +101,7 @@ impl PerformanceMonitor {
 
         timing.last_report_time = now;
         timing.last_report_records = total_records;
+        timing.rate_samples.push(current_rate);
 
         PerformanceStats {
             total_records,
@@ -136,8 +148,28 @@ impl PerformanceMonitor {
         timing.start_time = now;
         timing.last_report_time = now;
         timing.last_report_records = 0;
+        timing.rate_samples.clear();
 
         info!("Performance monitor reset");
+    }
+
+    pub async fn get_percentile_stats(&self) -> PercentileStats {
+        let timing = self.timing.read().await;
+        let s = &timing.rate_samples;
+        if s.is_empty() {
+            return PercentileStats { avg: 0.0, min: 0.0, max: 0.0, p90: 0.0, p95: 0.0 };
+        }
+        let mut sorted: Vec<f64> = s.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = sorted.len();
+        let avg = sorted.iter().sum::<f64>() / n as f64;
+        PercentileStats {
+            avg: (avg * 10.0).round() / 10.0,
+            min: (sorted[0] * 10.0).round() / 10.0,
+            max: (sorted[n - 1] * 10.0).round() / 10.0,
+            p90: (sorted[(n as f64 * 0.9) as usize] * 10.0).round() / 10.0,
+            p95: (sorted[(n as f64 * 0.95) as usize] * 10.0).round() / 10.0,
+        }
     }
 
     pub fn get_total_records(&self) -> u64 {
