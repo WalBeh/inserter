@@ -593,6 +593,8 @@ async def run_async_engine(
                     "batch_interval": batch_interval,
                     "duration_minutes": duration,
                     "table_name": table_name,
+                    "shards": shards,
+                    "replicas": replicas,
                 },
                 "results": {
                     "total_records": final_stats["total_records"],

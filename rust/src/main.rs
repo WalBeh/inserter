@@ -362,6 +362,8 @@ async fn run_data_generation(
                 "batch_interval": config.batch_interval,
                 "duration_minutes": config.duration.unwrap(),
                 "table_name": table_name,
+                "shards": config.shards,
+                "replicas": config.replicas,
             },
             "results": {
                 "total_records": final_stats.total_records,
