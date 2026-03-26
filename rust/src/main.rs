@@ -360,6 +360,12 @@ async fn run_data_generation(
             }
         });
         println!("{}", serde_json::to_string(&result).unwrap());
+        // Summary to stderr for quick reading
+        let version = cluster_info.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        let avg = per_cpu.get("avg").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let p95 = per_cpu.get("p95").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let max = per_cpu.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        eprintln!("CrateDB {} | rec/s per CPU: avg={:.0} p95={:.0} max={:.0}", version, avg, p95, max);
     } else {
         // Normal mode
         info!("{}", "=".repeat(60));

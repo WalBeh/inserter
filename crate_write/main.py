@@ -565,6 +565,9 @@ async def run_async_engine(
             }
             # JSONL to stdout (one line, appendable)
             print(json.dumps(benchmark_result, separators=(",", ":")))
+            # Summary to stderr for quick reading
+            version = cluster_info.get("version", "?")
+            print(f"CrateDB {version} | rec/s per CPU: avg={per_cpu['avg']:.0f} p95={per_cpu['p95']:.0f} max={per_cpu['max']:.0f}", file=sys.stderr)
         else:
             # Normal mode: human-readable output
             sent = final_stats["total_records"]
