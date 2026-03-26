@@ -388,7 +388,8 @@ async fn run_data_generation(
         let avg = per_cpu.get("avg").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let p95 = per_cpu.get("p95").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let max = per_cpu.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        eprintln!("CrateDB {} | rec/s per CPU: avg={:.0} p95={:.0} max={:.0}", version, avg, p95, max);
+        let total_cpus_int = cluster_info.get("total_cpus").and_then(|v| v.as_u64()).unwrap_or(1);
+        eprintln!("CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0}", version, total_cpus_int, rate_stats.p90, avg, p95, max);
     } else {
         // Normal mode
         info!("{}", "=".repeat(60));

@@ -616,7 +616,8 @@ async def run_async_engine(
             sys.stdout.buffer.flush()
             # Summary to stderr for quick reading
             version = cluster_info.get("version", "?")
-            print(f"CrateDB {version} | rec/s per CPU: avg={per_cpu['avg']:.0f} p95={per_cpu['p95']:.0f} max={per_cpu['max']:.0f}", file=sys.stderr)
+            p90_total = rate_stats.get('p90', 0)
+            print(f"CrateDB {version} | {total_cpus} CPUs | p90={p90_total:.0f} rec/s | per CPU: avg={per_cpu['avg']:.0f} p95={per_cpu['p95']:.0f} max={per_cpu['max']:.0f}", file=sys.stderr)
         else:
             # Normal mode: human-readable output
             sent = final_stats["total_records"]
