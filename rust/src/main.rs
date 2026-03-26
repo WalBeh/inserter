@@ -363,7 +363,7 @@ async fn run_data_generation(
             "config": {
                 "threads": config.threads,
                 "batch_size": config.batch_size,
-                "batch_interval": config.batch_interval,
+                "batch_interval": config.batch_interval as f64 / 1000.0,
                 "duration_minutes": config.duration.unwrap(),
                 "table_name": table_name,
                 "shards": config.shards,
