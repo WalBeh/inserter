@@ -186,6 +186,10 @@ Desktop.ini
 # uv specific
 .uv_cache/
 
+# EC2 benchmark keys and state
+bench-key.pem
+.ec2-bench-instance
+
 # Rust config (may contain credentials)
 rust/config.toml
 
