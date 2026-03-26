@@ -1,6 +1,6 @@
 # CrateDB Record Generator — Rust Implementation
 
-High-performance CrateDB record generator using tokio async runtime and reqwest HTTP client.
+High-performance CrateDB record generator using tokio async runtime, reqwest HTTP client, and gzip compression.
 
 ## Build & Run
 
@@ -10,100 +10,105 @@ cd rust
 # Set up connection
 echo 'CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200' > .env
 
-# Run with config.toml defaults (32 threads, batch_size 1000, no delay)
+# Create config (optional — auto-detected if present)
+cat > config.toml << 'EOF'
+table_name = "performance_test"
+duration = 10
+batch_size = 1000
+batch_interval = 0
+threads = 128
+objects = 0
+dashboard = false
+log_level = "info"
+EOF
+
+# Run with config.toml defaults
 cargo run
 
 # Or specify everything on the CLI
-cargo run -- --table-name stress_test --duration 5 --threads 64 --batch-size 2000 --batch-interval 0
+cargo run -- --table-name stress_test --duration 5 --threads 128 --batch-size 1000 --batch-interval 0
 
 # Release build for max performance
 cargo build --release
 ./target/release/crate-write
 ```
 
-## Configuration
-
-### config.toml (auto-detected in current directory)
-
-```toml
-table_name = "performance_test"
-duration = 10
-batch_size = 1000
-batch_interval = 0      # milliseconds, 0 = no delay
-threads = 32
-objects = 0
-log_level = "info"
-```
-
-CLI arguments override config.toml values when explicitly provided. The connection string comes from `.env` or `--connection-string`.
-
-### CLI Options
+## CLI Options
 
 ```
 --table-name <NAME>           Table to create/insert into
 --duration <MINUTES>          Minutes to run
---connection-string <URL>     CrateDB URL (overrides .env / CRATE_CONNECTION_STRING)
+--connection-string <URL>     CrateDB URL (overrides .env)
 --batch-size <SIZE>           Records per bulk insert
 --batch-interval <MS>         Milliseconds between batches (0 = none)
 --threads <COUNT>             Concurrent async worker tasks
 --objects <COUNT>             Extra low-cardinality TEXT columns
 --test-loadbalancer           Run 5-tuple load balancer test and exit
+--benchmark                   Minimal output, JSONL result to stdout
 --log-level <LEVEL>           error, warn, info, debug, trace
 --config <FILE>               Config file path (.toml or .json)
 ```
+
+Config file values are defaults — CLI args override only when explicitly provided. Connection string comes from `.env` or `--connection-string`.
 
 ## Architecture
 
 ### Worker Loop
 
-Each worker task runs in a tight loop:
-
 ```
-generate_batch(batch_size)  →  execute_bulk(sql, params)  →  [sleep if interval > 0]  →  repeat
+spawn_blocking(generate_batch + into_params)  →  spawn_blocking(serialize + gzip)  →  await HTTP POST  →  repeat
 ```
 
-- **Record generation** is synchronous (no async overhead for CPU work)
-- **HTTP insert** is async via tokio + reqwest with connection pooling
-- **Monitor** uses `AtomicU64` counters — no lock contention between workers
+- **CPU work** (record generation, JSON serialization, gzip compression) runs on tokio's blocking thread pool via `spawn_blocking`
+- **HTTP I/O** runs on tokio's async thread pool, free to multiplex many concurrent requests
+- **Monitor** uses `AtomicU64` counters — zero lock contention between workers
+- **Payloads** are gzip-compressed (flate2 fast / level 1, ~88% size reduction)
+
+This separation is critical for scaling: without `spawn_blocking`, CPU work blocks the tokio I/O threads and throughput drops at high concurrency (18K → 31K rec/sec improvement at 64 threads).
 
 ### Connection Pool
 
-The reqwest HTTP client pool is sized to `max(threads + 2, 10)` connections, with 60s keepalive and 60s request timeout. For high thread counts, each worker gets its own pooled connection.
+Sized to `max(threads + 2, 10)` with 60s keepalive and 60s request timeout.
 
-### Record Verification
+## Benchmark Mode
 
-After all workers stop, the engine:
-1. Runs `REFRESH TABLE` to flush pending writes
-2. Runs `SELECT COUNT(*)` to verify actual row count
-3. Compares against records sent and reports match/mismatch
+```bash
+cargo run -- --benchmark --table-name bench --duration 2 --threads 128 --batch-size 1000 --batch-interval 0 >> results.json
+```
+
+- Suppresses progress logs and load balancer test
+- Queries cluster info from `sys.nodes` (CPUs, memory, disk, heap, version)
+- Collects rate samples every 10s for percentile stats
+- Outputs single-line JSON to stdout (`client: "rust-http"`)
+- Prints summary to stderr: `CrateDB 6.2.1 | rec/s per CPU: avg=2478 p95=3583 max=3583`
+
+Multiple runs append as JSONL (one JSON object per line).
 
 ## Performance
 
-With a remote CrateDB Cloud cluster (~150ms latency):
+Tested against a 3-node CrateDB Cloud cluster (~150ms latency):
 
 | Threads | Batch Size | Interval | Throughput |
 |---------|-----------|----------|------------|
-| 1 | 100 | 100ms | ~260 rec/sec |
-| 8 | 500 | 50ms | ~2,000 rec/sec |
-| 32 | 1000 | 0 | ~15,000 rec/sec |
-| 64 | 2000 | 0 | ~18,000+ rec/sec |
+| 32 | 1000 | 0 | ~31,000 rec/sec |
+| 64 | 1000 | 0 | ~31,000 rec/sec |
+| **128** | **1000** | **0** | **~34,000 rec/sec** |
 
-The bottleneck at high concurrency is CrateDB's ingestion speed, not the client.
+At high concurrency the bottleneck is CrateDB ingestion, not the client.
 
 ## Tests
 
 ```bash
-cargo test
+cargo test    # 19 tests
 ```
-
-19 tests covering client creation, URL parsing, auth headers, config loading/validation, record generation, batch generation, parameter serialization, and monitor operations.
 
 ## Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| tokio | Async runtime |
+| tokio | Async runtime + spawn_blocking |
 | reqwest | HTTP client with connection pooling |
+| flate2 | Gzip compression |
 | clap | CLI argument parsing |
 | serde / serde_json | JSON serialization |
 | fake | Random data generation |

@@ -6,13 +6,14 @@ High-performance record generators for CrateDB. Available in Python (async) and 
 
 | | Python (async) | Rust |
 |---|---|---|
-| **Engine** | asyncio + aiohttp | tokio + reqwest |
-| **Concurrency** | Async tasks (no GIL) | Async tasks + thread pool |
-| **Throughput** | ~15,000-17,000 rec/sec | ~15,000-20,000 rec/sec |
+| **Engine** | asyncio + aiohttp | tokio + reqwest + spawn_blocking |
+| **Concurrency** | Async tasks (no GIL) | Async I/O + blocking thread pool |
+| **Compression** | gzip level 1 | flate2 fast |
+| **Throughput** | ~33,000 rec/sec | ~34,000 rec/sec |
 | **Memory** | ~30-100MB | ~5-50MB |
 | **Setup** | `uv run crate-write` | `cargo run` |
 
-Both implementations share the same CLI interface, table schema, and record format.
+Both share the same CLI interface, table schema, and record format. Throughput numbers from a 3-node CrateDB Cloud cluster.
 
 ## Quick Start
 
@@ -26,8 +27,8 @@ uv pip install -e .
 # Configure connection
 echo 'CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200' > .env
 
-# Run (1 minute, 32 async tasks, batch size 1000, no delay)
-uv run crate-write --table-name test_events --duration 1 --threads 32 --batch-size 1000 --batch-interval 0
+# Run (1 minute, 64 async tasks, batch size 1000, no delay)
+uv run crate-write --table-name test_events --duration 1 --threads 64 --batch-size 1000 --batch-interval 0
 ```
 
 ### Rust
@@ -35,10 +36,20 @@ uv run crate-write --table-name test_events --duration 1 --threads 32 --batch-si
 ```bash
 cd rust
 
-# Configure connection
+# Configure connection and config
 echo 'CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200' > .env
+cat > config.toml << 'EOF'
+table_name = "performance_test"
+duration = 10
+batch_size = 1000
+batch_interval = 0
+threads = 128
+objects = 0
+dashboard = false
+log_level = "info"
+EOF
 
-# Run (reads config.toml: 32 threads, batch_size 1000, batch_interval 0)
+# Run (reads config.toml automatically)
 cargo run
 ```
 
@@ -55,19 +66,7 @@ LOG_LEVEL=INFO
 
 ### Rust Config File
 
-The Rust implementation auto-detects `rust/config.toml`:
-
-```toml
-table_name = "performance_test"
-duration = 10
-batch_size = 1000
-batch_interval = 0
-threads = 32
-objects = 0
-log_level = "info"
-```
-
-CLI arguments override config file values when explicitly provided.
+The Rust implementation auto-detects `rust/config.toml` (gitignored — may contain credentials). CLI arguments override config file values when explicitly provided.
 
 ## CLI Options
 
@@ -82,7 +81,27 @@ Both implementations accept the same flags:
 --threads               Concurrent async tasks (default: 1)
 --objects               Extra low-cardinality TEXT columns (default: 0)
 --test-loadbalancer     Run 5-tuple load balancer test and exit
+--benchmark             Minimal output, JSONL result to stdout
 ```
+
+## Benchmark Mode
+
+Both implementations support `--benchmark` for structured, machine-readable output:
+
+```bash
+# Run benchmark, append JSON result to file
+uv run crate-write --benchmark --table-name bench1 --duration 2 --threads 64 --batch-size 1000 --batch-interval 0 >> results.json
+cargo run -- --benchmark --table-name bench2 --duration 2 --threads 128 --batch-size 1000 --batch-interval 0 >> results.json
+```
+
+In benchmark mode:
+- Progress logs and load balancer test are suppressed
+- Cluster info is queried from `sys.nodes` (CPUs, memory, disk, heap, version)
+- Rate samples are collected every 10 seconds for percentile stats
+- A single-line JSON object is printed to stdout (JSONL, appendable with `>>`)
+- A summary line is printed to stderr: `CrateDB 6.2.1 | rec/s per CPU: avg=1842 p95=2017 max=2017`
+
+The JSON includes: timestamp, client type (`python-http` / `rust-http`), cluster info, run config, and results with min/max/avg/p90/p95 for both `records_per_second` and `records_per_cpu_second`.
 
 ## Table Schema
 
@@ -113,37 +132,28 @@ For maximum throughput against a remote cluster:
 uv run crate-write --table-name perf --duration 5 --threads 64 --batch-size 1000 --batch-interval 0
 
 # Rust
-cargo run -- --table-name perf --duration 5 --threads 64 --batch-size 1000 --batch-interval 0
+cargo run -- --table-name perf --duration 5 --threads 128 --batch-size 1000 --batch-interval 0
 ```
 
 Key parameters:
 - **--threads 32-128**: More concurrent tasks = more HTTP requests in-flight while waiting for responses
-- **--batch-size 1000-5000**: Larger batches = fewer HTTP roundtrips
+- **--batch-size 1000**: Sweet spot — larger batches increase serialization time without proportional network savings
 - **--batch-interval 0**: No artificial delay between batches
 
-The bottleneck is typically CrateDB ingestion speed and network latency, not the client.
+Both implementations use gzip compression on bulk payloads (~88% size reduction), reducing bandwidth usage significantly.
 
 ## Record Verification
 
-Both implementations verify records after completion:
-
-1. `REFRESH TABLE` to flush pending writes
-2. `SELECT COUNT(*)` to get actual row count
-3. Compare against records sent, report match or mismatch
+Both implementations verify records after completion by comparing `SELECT COUNT(*)` (minus pre-existing rows) against records sent.
 
 ## Load Balancer Testing
 
-Both implementations include a 5-tuple load balancer distribution test:
-
 ```bash
-# Python
 uv run crate-write --test-loadbalancer
-
-# Rust
 cargo run -- --test-loadbalancer
 ```
 
-This creates fresh TCP connections to test whether the load balancer distributes traffic across CrateDB nodes using 5-tuple hashing.
+Creates fresh TCP connections to test whether the load balancer distributes traffic across CrateDB nodes using 5-tuple hashing. In normal mode, Python runs this automatically before starting workers.
 
 ## Project Structure
 
@@ -154,14 +164,15 @@ This creates fresh TCP connections to test whether the load balancer distributes
 │   └── main.py              # Python async engine (aiohttp)
 ├── rust/
 │   ├── src/
-│   │   ├── main.rs           # CLI, table creation, worker loop
-│   │   ├── client.rs          # HTTP client (reqwest)
+│   │   ├── main.rs           # CLI, worker loop, benchmark JSON
+│   │   ├── client.rs          # HTTP client (reqwest, gzip, spawn_blocking)
 │   │   ├── generator.rs       # Record generation
-│   │   ├── monitor.rs         # Atomic performance counters
+│   │   ├── monitor.rs         # Atomic counters + percentile stats
 │   │   └── config.rs          # TOML/JSON config loading
-│   ├── config.toml            # Default config
+│   ├── config.toml            # Default config (gitignored)
 │   └── Cargo.toml
 ├── pyproject.toml
+├── BENCHMARKS.md              # Performance comparison data
 ├── .env                       # Connection string (gitignored)
 └── README.md
 ```
@@ -170,32 +181,24 @@ This creates fresh TCP connections to test whether the load balancer distributes
 
 The original Python implementation used `threading.Thread` workers with the `requests` library. This had several compounding bottlenecks:
 
-1. **GIL serialization**: Python's Global Interpreter Lock meant only one thread could generate records at a time, even with multiple OS threads. Record generation (~12ms per batch) blocked all other threads.
-2. **Sequential worker loop**: Each thread did generate → HTTP POST → `time.sleep(0.1)` → repeat. Nothing overlapped. With default settings, each thread managed ~500 records/sec.
-3. **Connection pool limits**: `requests.Session()` defaults to 10 connections per host (urllib3 default). Under load, extra requests queued for a connection or triggered new TLS handshakes (~100-200ms each).
-4. **Lock contention**: A `threading.Lock` was acquired on every batch insert to update the performance monitor counters.
+1. **GIL serialization**: Only one thread could generate records at a time.
+2. **Sequential worker loop**: generate → HTTP POST → `time.sleep(0.1)` → repeat. Nothing overlapped.
+3. **Connection pool limits**: `requests.Session()` defaults to 10 connections per host.
+4. **Lock contention**: `threading.Lock` acquired on every batch insert.
 
-The fix was to replace the entire insertion engine with **asyncio + aiohttp**:
+The fix was **asyncio + aiohttp**: a single event loop runs N async tasks with unlimited connections, no GIL contention, no locks, and gzip compression on all payloads.
 
-- A single event loop runs N async tasks (e.g., 64). While one task awaits the HTTP response from CrateDB, the others are free to generate and send batches. This sidesteps the GIL entirely — there's only one thread, so no contention.
-- `aiohttp.TCPConnector(limit=0)` removes the connection pool cap. Dozens of HTTP requests fly concurrently.
-- The performance monitor no longer needs a lock (single-threaded async = no races).
-- `time.sleep()` was replaced with `asyncio.sleep()` (or removed entirely with `--batch-interval 0`).
+Similarly, Rust was improved by moving CPU work (record generation + JSON serialization + gzip) to `spawn_blocking`, keeping tokio I/O threads free for HTTP multiplexing.
 
-**Result**: Python went from ~260 records/sec (1 thread, default settings) to **~17,000 records/sec** (64 async tasks, batch_size 1000, no delay) — within striking distance of the Rust implementation.
+### Benchmark Results (3-node CrateDB Cloud, ~150ms latency)
 
-### Python vs Rust (same cluster, same settings)
-
-Tested against a single-node CrateDB Cloud cluster with ~150ms network latency:
-
-| | Python (async) | Rust (tokio) |
+| | Python | Rust |
 |---|---|---|
-| 32 tasks, batch 1000 | ~15,000 rec/sec | ~15,000 rec/sec |
-| 64 tasks, batch 1000 | ~17,000 rec/sec | ~18,000 rec/sec |
-| Memory usage | ~50MB | ~10MB |
-| Errors | 0 | 0 |
+| Best config | 64 tasks / 1000 batch | 128 threads / 1000 batch |
+| **Throughput** | **32,895 rec/sec** | **33,565 rec/sec** |
+| Errors | 5 | 0 |
 
-At this point the bottleneck is CrateDB ingestion and network latency, not the client. Rust has a small edge due to lower per-request overhead and true parallelism in record generation, but for this I/O-bound workload the difference is marginal.
+See `BENCHMARKS.md` for full data including percentile breakdowns and per-CPU metrics.
 
 ## License
 
