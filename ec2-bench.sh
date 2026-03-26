@@ -47,23 +47,45 @@ launch)
         aws ec2 authorize-security-group-ingress --region $REGION \
             --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
 
-        # Find a public subnet in this VPC
-        SUBNET_ID=$(aws ec2 describe-subnets --region $REGION \
-            --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" \
-            --query 'Subnets[0].SubnetId' --output text 2>/dev/null || echo "None")
-        if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
-            # Fall back to first subnet
-            SUBNET_ID=$(aws ec2 describe-subnets --region $REGION \
-                --filters "Name=vpc-id,Values=$VPC_ID" \
-                --query 'Subnets[0].SubnetId' --output text)
+        # Find a subnet in an AZ that supports our instance type
+        SUPPORTED_AZS=$(aws ec2 describe-instance-type-offerings --region $REGION \
+            --location-type availability-zone \
+            --filters "Name=instance-type,Values=$INSTANCE_TYPE" \
+            --query 'InstanceTypeOfferings[*].Location' --output text)
+
+        SUBNET_ID="None"
+        for AZ in $SUPPORTED_AZS; do
+            CANDIDATE=$(aws ec2 describe-subnets --region $REGION \
+                --filters "Name=vpc-id,Values=$VPC_ID" "Name=availability-zone,Values=$AZ" \
+                --query 'Subnets[0].SubnetId' --output text 2>/dev/null || echo "None")
+            if [ "$CANDIDATE" != "None" ] && [ -n "$CANDIDATE" ]; then
+                SUBNET_ID=$CANDIDATE
+                echo "Using AZ: $AZ"
+                break
+            fi
+        done
+        if [ "$SUBNET_ID" = "None" ]; then
+            echo "ERROR: No subnet found in a supported AZ for $INSTANCE_TYPE"
+            exit 1
         fi
     else
-        # Get subnet from existing SG's VPC
+        # Get subnet from existing SG's VPC, in a supported AZ
         VPC_ID=$(aws ec2 describe-security-groups --region $REGION \
             --group-ids $SG_ID --query 'SecurityGroups[0].VpcId' --output text)
-        SUBNET_ID=$(aws ec2 describe-subnets --region $REGION \
-            --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'Subnets[0].SubnetId' --output text)
+        SUPPORTED_AZS=$(aws ec2 describe-instance-type-offerings --region $REGION \
+            --location-type availability-zone \
+            --filters "Name=instance-type,Values=$INSTANCE_TYPE" \
+            --query 'InstanceTypeOfferings[*].Location' --output text)
+        SUBNET_ID="None"
+        for AZ in $SUPPORTED_AZS; do
+            CANDIDATE=$(aws ec2 describe-subnets --region $REGION \
+                --filters "Name=vpc-id,Values=$VPC_ID" "Name=availability-zone,Values=$AZ" \
+                --query 'Subnets[0].SubnetId' --output text 2>/dev/null || echo "None")
+            if [ "$CANDIDATE" != "None" ] && [ -n "$CANDIDATE" ]; then
+                SUBNET_ID=$CANDIDATE
+                break
+            fi
+        done
     fi
     echo "Security group: $SG_ID"
     echo "Subnet: $SUBNET_ID"
