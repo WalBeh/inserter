@@ -186,5 +186,8 @@ Desktop.ini
 # uv specific
 .uv_cache/
 
+# Rust config (may contain credentials)
+rust/config.toml
+
 # Claude working notes
 progress_log.md
