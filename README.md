@@ -137,10 +137,28 @@ cargo run -- --table-name perf --duration 5 --threads 128 --batch-size 1000 --ba
 
 Key parameters:
 - **--threads 32-128**: More concurrent tasks = more HTTP requests in-flight while waiting for responses
-- **--batch-size 1000**: Sweet spot — larger batches increase serialization time without proportional network savings
+- **--batch-size 1000-1200**: Sweet spot — larger batches increase serialization time without proportional network savings
 - **--batch-interval 0**: No artificial delay between batches
+- **--shards 12**: More shards = more write parallelism (4 per node on a 3-node cluster gave +56% throughput)
+- **--replicas 0**: Skip replica writes for pure throughput benchmarks
 
 Both implementations use gzip compression on bulk payloads (~88% size reduction), reducing bandwidth usage significantly.
+
+### Measure your RTT to the cluster
+
+Network latency between your client and CrateDB is the single biggest factor in throughput. Measure it with:
+
+```bash
+curl -o /dev/null -s -w "%{time_connect}\n" https://your-cluster:4200/
+```
+
+Example RTT values and their impact (3-node cr2 cluster, us-east-1):
+
+| Client location | RTT | Throughput (Python 64/1200) |
+|---|---|---|
+| Hetzner Ashburn (same coast) | ~40ms | ~50,000 rec/sec |
+| Hetzner Frankfurt (cross-Atlantic) | ~180ms | ~32,000 rec/sec |
+| Laptop (home internet, ~150ms) | ~150ms | ~33,000 rec/sec |
 
 ## Record Verification
 
