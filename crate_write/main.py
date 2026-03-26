@@ -452,6 +452,7 @@ async def run_async_engine(
     benchmark: bool = False,
     shards: int = 4,
     replicas: int = 1,
+    compress: bool = True,
 ):
     """Main async engine: creates aiohttp session, spawns workers, runs for duration."""
 
@@ -495,7 +496,7 @@ async def run_async_engine(
         auth=auth,
         headers={"Content-Type": "application/json"},
     ) as session:
-        client = AsyncCrateClient(session, base_url)
+        client = AsyncCrateClient(session, base_url, compress=compress)
 
         # Create table (reuse sync client for setup)
         setup_client = CrateDBClient(connection_string)
@@ -1324,9 +1325,14 @@ def reporter_thread(monitor: PerformanceMonitor, stop_event: threading.Event, nu
     default=1,
     help="Number of replicas for table creation (default: 1)"
 )
+@click.option(
+    "--no-compression",
+    is_flag=True,
+    help="Disable gzip compression (faster on localhost/low-latency)"
+)
 def cli(table_name: Optional[str], connection_string: Optional[str], duration: Optional[int],
         batch_size: int, batch_interval: float, threads: int, objects: int, test_loadbalancer: bool,
-        benchmark: bool, shards: int, replicas: int):
+        benchmark: bool, shards: int, replicas: int, no_compression: bool):
     """
     Generate and insert random records into CrateDB for testing purposes.
 
@@ -1408,6 +1414,7 @@ def cli(table_name: Optional[str], connection_string: Optional[str], duration: O
             benchmark=benchmark,
             shards=shards,
             replicas=replicas,
+            compress=not no_compression,
         ))
     except KeyboardInterrupt:
         logger.warning("Interrupted")

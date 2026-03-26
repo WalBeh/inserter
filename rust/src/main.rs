@@ -83,6 +83,10 @@ struct Cli {
     /// Number of replicas for table creation
     #[arg(long)]
     replicas: Option<usize>,
+
+    /// Disable gzip compression (faster on localhost/low-latency)
+    #[arg(long)]
+    no_compression: bool,
 }
 
 fn sanitize_connection_string(connection_string: &str) -> String {
@@ -800,8 +804,9 @@ async fn main() -> Result<()> {
 
     // Create client with connection pool sized to thread count
     let pool_size = std::cmp::max(config.threads + 2, 10);
-    let client = CrateClient::with_pool_size(config.connection_string.as_ref().unwrap(), pool_size).await?;
-    info!("Connection pool size: {}", pool_size);
+    let compress = !cli.no_compression;
+    let client = CrateClient::with_options(config.connection_string.as_ref().unwrap(), pool_size, compress).await?;
+    info!("Connection pool size: {}, compression: {}", pool_size, if compress { "gzip" } else { "off" });
 
     // Create performance monitor
     let monitor = PerformanceMonitor::new();

@@ -15,6 +15,7 @@ pub struct CrateClient {
     client: Client,
     base_url: String,
     auth_header: Option<String>,
+    compress: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,10 +41,14 @@ pub struct SqlResponse {
 
 impl CrateClient {
     pub async fn new(connection_string: &str) -> Result<Self> {
-        Self::with_pool_size(connection_string, 50).await
+        Self::with_options(connection_string, 50, true).await
     }
 
     pub async fn with_pool_size(connection_string: &str, pool_size: usize) -> Result<Self> {
+        Self::with_options(connection_string, pool_size, true).await
+    }
+
+    pub async fn with_options(connection_string: &str, pool_size: usize, compress: bool) -> Result<Self> {
         let url = Url::parse(connection_string)
             .with_context(|| format!("Invalid connection string: {}", connection_string))?;
 
@@ -78,6 +83,7 @@ impl CrateClient {
             client,
             base_url,
             auth_header,
+            compress,
         })
     }
 
@@ -139,9 +145,10 @@ impl CrateClient {
             return Ok((0, 0.0));
         }
 
-        // Move CPU-heavy work (JSON serialize + gzip) to blocking thread pool
+        // Move CPU-heavy work (JSON serialize + optional gzip) to blocking thread pool
         let sql_owned = sql.to_string();
-        let compressed = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let do_compress = self.compress;
+        let (body, is_compressed) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, bool)> {
             let request = SqlRequest {
                 stmt: sql_owned,
                 args: None,
@@ -151,23 +158,31 @@ impl CrateClient {
             let json_bytes = serde_json::to_vec(&request)
                 .context("Failed to serialize bulk request")?;
 
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-            encoder.write_all(&json_bytes)
-                .context("Failed to gzip compress payload")?;
-            encoder.finish()
-                .context("Failed to finish gzip compression")
+            if do_compress {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+                encoder.write_all(&json_bytes)
+                    .context("Failed to gzip compress payload")?;
+                let compressed = encoder.finish()
+                    .context("Failed to finish gzip compression")?;
+                Ok((compressed, true))
+            } else {
+                Ok((json_bytes, false))
+            }
         }).await
             .context("Blocking task panicked")??;
 
-        let bytes_sent = compressed.len();
+        let bytes_sent = body.len();
         let start = std::time::Instant::now();
 
         let url = format!("{}/_sql", self.base_url);
         let mut req_builder = self.client
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Content-Encoding", "gzip")
-            .body(compressed);
+            .body(body);
+
+        if is_compressed {
+            req_builder = req_builder.header("Content-Encoding", "gzip");
+        }
 
         if let Some(ref auth) = self.auth_header {
             req_builder = req_builder.header("Authorization", auth);
