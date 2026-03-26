@@ -2,6 +2,25 @@
 
 High-performance CrateDB record generator using tokio async runtime, reqwest HTTP client, and gzip compression.
 
+## Prerequisites
+
+Rust 1.70+ and a C compiler with OpenSSL headers:
+
+```bash
+# macOS (usually pre-installed)
+xcode-select --install
+
+# Amazon Linux / RHEL / Fedora
+sudo yum install -y gcc openssl-devel
+
+# Ubuntu / Debian
+sudo apt install -y build-essential libssl-dev pkg-config
+
+# Install Rust (if needed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
+```
+
 ## Build & Run
 
 ```bash
