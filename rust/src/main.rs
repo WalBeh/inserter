@@ -237,8 +237,9 @@ async fn run_data_generation(
 
                         // Insert batch — serialize+gzip also on blocking thread (inside execute_bulk)
                         match client.execute_bulk(&insert_sql, params).await {
-                            Ok(_) => {
+                            Ok((bytes_sent, latency_ms)) => {
                                 monitor.add_records(batch_size);
+                                monitor.add_request_stats(bytes_sent, latency_ms).await;
                             }
                             Err(e) => {
                                 error!("Worker {} error: {}", worker_id, e);
@@ -329,6 +330,9 @@ async fn run_data_generation(
     if benchmark {
         // Benchmark mode: JSONL to stdout
         let rate_stats = monitor.get_percentile_stats().await;
+        let latency_stats = monitor.get_latency_stats().await;
+        let bandwidth_mbps = monitor.get_bandwidth_mbps().await;
+        let bytes_sent = monitor.get_total_bytes_sent();
         let total_cpus = cluster_info.get("total_cpus").and_then(|v| v.as_u64()).unwrap_or(1) as f64;
         let per_cpu = serde_json::json!({
             "avg": (rate_stats.avg / total_cpus * 10.0).round() / 10.0,
@@ -356,6 +360,9 @@ async fn run_data_generation(
                 "errors": final_stats.total_errors,
                 "records_per_second": rate_stats,
                 "records_per_cpu_second": per_cpu,
+                "request_latency_ms": latency_stats,
+                "bytes_sent": bytes_sent,
+                "bandwidth_mbps": (bandwidth_mbps * 100.0).round() / 100.0,
                 "verified_count": verified_count,
             }
         });

@@ -29,6 +29,7 @@ struct TimingState {
     last_report_time: Instant,
     last_report_records: u64,
     rate_samples: Vec<f64>,
+    latency_samples: Vec<f64>,
 }
 
 /// Lock-free counters for the hot path
@@ -36,6 +37,7 @@ struct Counters {
     total_records: AtomicU64,
     total_batches: AtomicU64,
     total_errors: AtomicU64,
+    total_bytes_sent: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -53,12 +55,14 @@ impl PerformanceMonitor {
                 total_records: AtomicU64::new(0),
                 total_batches: AtomicU64::new(0),
                 total_errors: AtomicU64::new(0),
+                total_bytes_sent: AtomicU64::new(0),
             }),
             timing: Arc::new(RwLock::new(TimingState {
                 start_time: now,
                 last_report_time: now,
                 last_report_records: 0,
                 rate_samples: Vec::new(),
+                latency_samples: Vec::new(),
             })),
         }
     }
@@ -73,6 +77,13 @@ impl PerformanceMonitor {
     /// Lock-free: no contention between workers
     pub fn add_error(&self) {
         self.counters.total_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Track bytes sent and request latency (latency needs lock, but batched)
+    pub async fn add_request_stats(&self, bytes_sent: usize, latency_ms: f64) {
+        self.counters.total_bytes_sent.fetch_add(bytes_sent as u64, Ordering::Relaxed);
+        let mut timing = self.timing.write().await;
+        timing.latency_samples.push(latency_ms);
     }
 
     /// Called only by the reporting task every 10 seconds
@@ -142,6 +153,7 @@ impl PerformanceMonitor {
         self.counters.total_records.store(0, Ordering::Relaxed);
         self.counters.total_batches.store(0, Ordering::Relaxed);
         self.counters.total_errors.store(0, Ordering::Relaxed);
+        self.counters.total_bytes_sent.store(0, Ordering::Relaxed);
 
         let mut timing = self.timing.write().await;
         let now = Instant::now();
@@ -149,17 +161,41 @@ impl PerformanceMonitor {
         timing.last_report_time = now;
         timing.last_report_records = 0;
         timing.rate_samples.clear();
+        timing.latency_samples.clear();
 
         info!("Performance monitor reset");
     }
 
     pub async fn get_percentile_stats(&self) -> PercentileStats {
         let timing = self.timing.read().await;
-        let s = &timing.rate_samples;
-        if s.is_empty() {
+        Self::compute_percentiles(&timing.rate_samples)
+    }
+
+    pub async fn get_latency_stats(&self) -> PercentileStats {
+        let timing = self.timing.read().await;
+        Self::compute_percentiles(&timing.latency_samples)
+    }
+
+    pub async fn get_bandwidth_mbps(&self) -> f64 {
+        let bytes = self.counters.total_bytes_sent.load(Ordering::Relaxed);
+        let timing = self.timing.read().await;
+        let elapsed = Instant::now().duration_since(timing.start_time).as_secs_f64();
+        if elapsed > 0.0 {
+            (bytes as f64 * 8.0 / 1_000_000.0) / elapsed
+        } else {
+            0.0
+        }
+    }
+
+    pub fn get_total_bytes_sent(&self) -> u64 {
+        self.counters.total_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    fn compute_percentiles(samples: &[f64]) -> PercentileStats {
+        if samples.is_empty() {
             return PercentileStats { avg: 0.0, min: 0.0, max: 0.0, p90: 0.0, p95: 0.0 };
         }
-        let mut sorted: Vec<f64> = s.clone();
+        let mut sorted: Vec<f64> = samples.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = sorted.len();
         let avg = sorted.iter().sum::<f64>() / n as f64;

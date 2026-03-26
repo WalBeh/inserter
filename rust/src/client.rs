@@ -133,10 +133,10 @@ impl CrateClient {
     }
 
     /// Accept owned bulk_args, gzip-compress on blocking thread, send to CrateDB.
-    /// CPU work (serialize + gzip) runs on spawn_blocking so tokio I/O threads stay free.
-    pub async fn execute_bulk(&self, sql: &str, bulk_args: Vec<Vec<Value>>) -> Result<()> {
+    /// Returns (bytes_sent, latency_ms) for network stats tracking.
+    pub async fn execute_bulk(&self, sql: &str, bulk_args: Vec<Vec<Value>>) -> Result<(usize, f64)> {
         if bulk_args.is_empty() {
-            return Ok(());
+            return Ok((0, 0.0));
         }
 
         // Move CPU-heavy work (JSON serialize + gzip) to blocking thread pool
@@ -159,6 +159,9 @@ impl CrateClient {
         }).await
             .context("Blocking task panicked")??;
 
+        let bytes_sent = compressed.len();
+        let start = std::time::Instant::now();
+
         let url = format!("{}/_sql", self.base_url);
         let mut req_builder = self.client
             .post(&url)
@@ -179,9 +182,10 @@ impl CrateClient {
         if status.is_success() {
             let resp: SqlResponse = response.json().await
                 .context("Failed to parse bulk response")?;
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             debug!("Bulk insert successful: {} records in {:.2}ms",
                    resp.rowcount, resp.duration);
-            Ok(())
+            Ok((bytes_sent, latency_ms))
         } else {
             let error_text = response.text().await
                 .unwrap_or_else(|_| format!("HTTP {}", status));

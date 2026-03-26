@@ -240,7 +240,7 @@ class AsyncCrateClient:
         import gzip
         return gzip.compress(data, compresslevel=1)  # level 1 = fastest, still ~8x ratio on JSON
 
-    async def execute_bulk(self, sql: str, bulk_args: List[List]) -> dict:
+    async def execute_bulk(self, sql: str, bulk_args: List[List], monitor: "AsyncPerformanceMonitor" = None) -> dict:
         """Execute bulk insert with async HTTP, optionally gzip-compressed."""
         payload = json.dumps({"stmt": sql, "bulk_args": bulk_args}).encode()
 
@@ -250,6 +250,9 @@ class AsyncCrateClient:
         else:
             headers = {"Content-Type": "application/json"}
 
+        payload_size = len(payload)
+        start = time.monotonic()
+
         async with self.session.post(
             self.sql_url,
             data=payload,
@@ -257,7 +260,13 @@ class AsyncCrateClient:
             timeout=aiohttp.ClientTimeout(total=60),
         ) as response:
             response.raise_for_status()
-            return await response.json()
+            result = await response.json()
+
+        latency_ms = (time.monotonic() - start) * 1000.0
+        if monitor:
+            monitor.add_request_stats(payload_size, latency_ms)
+
+        return result
 
     async def execute(self, sql: str) -> dict:
         """Execute a SQL statement."""
@@ -282,10 +291,16 @@ class AsyncPerformanceMonitor:
         self.last_report_time = time.monotonic()
         self.last_report_records = 0
         self.rate_samples: List[float] = []
+        self.total_bytes_sent = 0
+        self.latency_samples: List[float] = []
 
     def add_records(self, count: int):
         self.total_records += count
         self.total_batches += 1
+
+    def add_request_stats(self, bytes_sent: int, latency_ms: float):
+        self.total_bytes_sent += bytes_sent
+        self.latency_samples.append(latency_ms)
 
     def add_error(self):
         self.errors += 1
@@ -326,6 +341,30 @@ class AsyncPerformanceMonitor:
             "p95": round(s[int(n * 0.95)] if n > 1 else s[0], 1),
         }
 
+    def _percentiles(self, samples: List[float]) -> Dict[str, float]:
+        if not samples:
+            return {"avg": 0, "min": 0, "max": 0, "p90": 0, "p95": 0}
+        s = sorted(samples)
+        n = len(s)
+        return {
+            "avg": round(sum(s) / n, 1),
+            "min": round(s[0], 1),
+            "max": round(s[-1], 1),
+            "p90": round(s[int(n * 0.9)] if n > 1 else s[0], 1),
+            "p95": round(s[int(n * 0.95)] if n > 1 else s[0], 1),
+        }
+
+    def get_latency_stats(self) -> Dict[str, float]:
+        return self._percentiles(self.latency_samples)
+
+    def get_network_stats(self) -> Dict[str, Any]:
+        elapsed = time.monotonic() - self.start_time
+        mbps = (self.total_bytes_sent * 8 / 1_000_000) / elapsed if elapsed > 0 else 0
+        return {
+            "bytes_sent": self.total_bytes_sent,
+            "bandwidth_mbps": round(mbps, 2),
+        }
+
 
 async def async_worker(
     worker_id: int,
@@ -343,7 +382,7 @@ async def async_worker(
     while not stop_event.is_set():
         try:
             batch = generator.generate_batch(batch_size)
-            await client.execute_bulk(insert_sql, batch)
+            await client.execute_bulk(insert_sql, batch, monitor=monitor)
             monitor.add_records(batch_size)
 
             if batch_interval > 0:
@@ -560,6 +599,8 @@ async def run_async_engine(
                     "errors": final_stats["errors"],
                     "records_per_second": rate_stats,
                     "records_per_cpu_second": per_cpu,
+                    "request_latency_ms": monitor.get_latency_stats(),
+                    **monitor.get_network_stats(),
                     "verified_count": verified_count,
                 },
             }
