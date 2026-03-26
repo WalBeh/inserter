@@ -25,6 +25,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from urllib.parse import urlparse
 import aiohttp
+import orjson
 
 
 def sanitize_connection_string(connection_string: str) -> str:
@@ -242,7 +243,7 @@ class AsyncCrateClient:
 
     async def execute_bulk(self, sql: str, bulk_args: List[List], monitor: "AsyncPerformanceMonitor" = None) -> dict:
         """Execute bulk insert with async HTTP, optionally gzip-compressed."""
-        payload = json.dumps({"stmt": sql, "bulk_args": bulk_args}).encode()
+        payload = orjson.dumps({"stmt": sql, "bulk_args": bulk_args})
 
         if self.compress:
             payload = self._compress(payload)
@@ -610,7 +611,9 @@ async def run_async_engine(
                 },
             }
             # JSONL to stdout (one line, appendable)
-            print(json.dumps(benchmark_result, separators=(",", ":")))
+            sys.stdout.buffer.write(orjson.dumps(benchmark_result))
+            sys.stdout.buffer.write(b"\n")
+            sys.stdout.buffer.flush()
             # Summary to stderr for quick reading
             version = cluster_info.get("version", "?")
             print(f"CrateDB {version} | rec/s per CPU: avg={per_cpu['avg']:.0f} p95={per_cpu['p95']:.0f} max={per_cpu['max']:.0f}", file=sys.stderr)
