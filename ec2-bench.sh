@@ -29,14 +29,44 @@ launch)
         --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
 
     if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+        # Find a VPC (prefer default, fall back to first available)
+        VPC_ID=$(aws ec2 describe-vpcs --region $REGION \
+            --filters "Name=isDefault,Values=true" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+        if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            VPC_ID=$(aws ec2 describe-vpcs --region $REGION \
+                --query 'Vpcs[0].VpcId' --output text)
+        fi
+        echo "Using VPC: $VPC_ID"
+
         echo "Creating security group with SSH access..."
         SG_ID=$(aws ec2 create-security-group --region $REGION \
             --group-name $SG_NAME --description "Benchmark SSH access" \
+            --vpc-id $VPC_ID \
             --query 'GroupId' --output text)
         aws ec2 authorize-security-group-ingress --region $REGION \
             --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
+
+        # Find a public subnet in this VPC
+        SUBNET_ID=$(aws ec2 describe-subnets --region $REGION \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" \
+            --query 'Subnets[0].SubnetId' --output text 2>/dev/null || echo "None")
+        if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
+            # Fall back to first subnet
+            SUBNET_ID=$(aws ec2 describe-subnets --region $REGION \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'Subnets[0].SubnetId' --output text)
+        fi
+    else
+        # Get subnet from existing SG's VPC
+        VPC_ID=$(aws ec2 describe-security-groups --region $REGION \
+            --group-ids $SG_ID --query 'SecurityGroups[0].VpcId' --output text)
+        SUBNET_ID=$(aws ec2 describe-subnets --region $REGION \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[0].SubnetId' --output text)
     fi
     echo "Security group: $SG_ID"
+    echo "Subnet: $SUBNET_ID"
 
     # Launch instance
     echo "Launching $INSTANCE_TYPE in $REGION..."
@@ -45,6 +75,7 @@ launch)
         --instance-type $INSTANCE_TYPE \
         --key-name $KEY_NAME \
         --security-group-ids $SG_ID \
+        --subnet-id $SUBNET_ID \
         --associate-public-ip-address \
         --query 'Instances[0].InstanceId' --output text)
 
