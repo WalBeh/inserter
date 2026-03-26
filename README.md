@@ -13,7 +13,7 @@ High-performance record generators for CrateDB. Available in Python (async) and 
 | **Memory** | ~30-100MB | ~5-50MB |
 | **Setup** | `uv run crate-write` | `cargo run` |
 
-Both share the same CLI interface, table schema, and record format. Throughput numbers from a 3-node CrateDB Cloud cluster.
+Both share the same CLI interface, table schema, and record format. Throughput numbers from a 3-node CrateDB Cloud cluster (cr2, 2 TiB EBS gp3, AWS NLB, us-east-1). Actual throughput depends on network latency and bandwidth between client and cluster.
 
 ## Quick Start
 
@@ -190,15 +190,18 @@ The fix was **asyncio + aiohttp**: a single event loop runs N async tasks with u
 
 Similarly, Rust was improved by moving CPU work (record generation + JSON serialization + gzip) to `spawn_blocking`, keeping tokio I/O threads free for HTTP multiplexing.
 
-### Benchmark Results (3-node CrateDB Cloud, ~150ms latency)
+### Benchmark Results
 
-| | Python | Rust |
-|---|---|---|
-| Best config | 64 tasks / 1000 batch | 128 threads / 1000 batch |
-| **Throughput** | **32,895 rec/sec** | **33,565 rec/sec** |
-| Errors | 5 | 0 |
+Tested against a 3-node CrateDB Cloud cluster (cr2 instance, 4 vCPU / 12 total, 2 TiB EBS gp3 per node, AWS NLB, us-east-1).
 
-See `BENCHMARKS.md` for full data including percentile breakdowns and per-CPU metrics.
+| Client location | Python | Rust | Bottleneck |
+|---|---|---|---|
+| Laptop (~150ms, ~30 Mbps up) | 32,895 rec/sec | 33,565 rec/sec | Uplink bandwidth |
+| Hetzner Frankfurt (~80ms) | 16,449 rec/sec | — | Cross-Atlantic latency |
+
+Both clients saturate the available bandwidth. From a client in the same AWS region (low latency, high bandwidth), throughput should approach the cluster's theoretical capacity of ~54K rec/sec (9K/cpu × 6 vCPU).
+
+See `BENCHMARKS.md` for full data including percentile breakdowns, per-CPU metrics, and latency/bandwidth stats.
 
 ## License
 
