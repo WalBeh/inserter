@@ -341,6 +341,14 @@ async fn run_data_generation(
         post_count.saturating_sub(pre_count)
     };
 
+    // Check for rejected writes
+    let rejected_writes = client.execute_query(
+        "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
+    ).await
+        .ok()
+        .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64())))
+        .unwrap_or(0);
+
     if benchmark {
         // Benchmark mode: JSONL to stdout
         let rate_stats = monitor.get_percentile_stats().await;
@@ -380,6 +388,7 @@ async fn run_data_generation(
                 "bytes_sent": bytes_sent,
                 "bandwidth_mbps": (bandwidth_mbps * 100.0).round() / 100.0,
                 "verified_count": verified_count,
+                "rejected_writes": rejected_writes,
             }
         });
         println!("{}", serde_json::to_string(&result).unwrap());
@@ -389,7 +398,8 @@ async fn run_data_generation(
         let p95 = per_cpu.get("p95").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let max = per_cpu.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let total_cpus_int = cluster_info.get("total_cpus").and_then(|v| v.as_u64()).unwrap_or(1);
-        eprintln!("CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0}", version, total_cpus_int, rate_stats.p90, avg, p95, max);
+        let rej_str = if rejected_writes > 0 { format!(" | REJECTED: {}", rejected_writes) } else { String::new() };
+        eprintln!("CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0}{}", version, total_cpus_int, rate_stats.p90, avg, p95, max, rej_str);
     } else {
         // Normal mode
         info!("{}", "=".repeat(60));

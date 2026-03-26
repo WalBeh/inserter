@@ -579,6 +579,16 @@ async def run_async_engine(
         except Exception as e:
             logger.warning(f"Failed to verify record count: {e}")
 
+        # Check for rejected writes
+        rejected_writes = 0
+        try:
+            result = await client.execute(
+                "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
+            )
+            rejected_writes = result.get("rows", [[0]])[0][0] or 0
+        except Exception as e:
+            logger.warning(f"Failed to query rejected writes: {e}")
+
         if benchmark:
             # Benchmark mode: output single-line JSON to stdout
             rate_stats = monitor.get_percentile_stats()
@@ -608,6 +618,7 @@ async def run_async_engine(
                     "request_latency_ms": monitor.get_latency_stats(),
                     **monitor.get_network_stats(),
                     "verified_count": verified_count,
+                    "rejected_writes": rejected_writes,
                 },
             }
             # JSONL to stdout (one line, appendable)
@@ -617,7 +628,8 @@ async def run_async_engine(
             # Summary to stderr for quick reading
             version = cluster_info.get("version", "?")
             p90_total = rate_stats.get('p90', 0)
-            print(f"CrateDB {version} | {total_cpus} CPUs | p90={p90_total:.0f} rec/s | per CPU: avg={per_cpu['avg']:.0f} p95={per_cpu['p95']:.0f} max={per_cpu['max']:.0f}", file=sys.stderr)
+            rej = f" | REJECTED: {rejected_writes}" if rejected_writes > 0 else ""
+            print(f"CrateDB {version} | {total_cpus} CPUs | p90={p90_total:.0f} rec/s | per CPU: avg={per_cpu['avg']:.0f} p95={per_cpu['p95']:.0f} max={per_cpu['max']:.0f}{rej}", file=sys.stderr)
         else:
             # Normal mode: human-readable output
             sent = final_stats["total_records"]
