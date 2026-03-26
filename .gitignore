@@ -185,3 +185,6 @@ Desktop.ini
 
 # uv specific
 .uv_cache/
+
+# Claude working notes
+progress_log.md
