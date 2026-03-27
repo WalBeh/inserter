@@ -148,14 +148,12 @@ defmodule CrateWrite.PIDController do
 
         IO.write(:stderr, "AUTO-TUNE: CLIFF at #{bad} senders (p95=#{round(p95)}ms) — bisecting [#{good}, #{bad}]\n")
 
-        # Lock batch size for bisection
-        %{state |
-          phase: :bisect,
-          bad: bad,
-          good: good,
-          adjustments: state.adjustments + 1
-        }
-        |> bisect_step()
+        # Enter bisection, try the midpoint
+        mid = div(good + bad, 2)
+        IO.write(:stderr, "AUTO-TUNE: BISECT next=#{mid} (bounds=[#{good}, #{bad}])\n")
+
+        state = set_senders(%{state | phase: :bisect, bad: bad, good: good}, mid)
+        %{state | adjustments: state.adjustments + 1}
       else
         # Under target — this count is good, keep probing
         state = %{state | good: state.current_senders}
