@@ -17,7 +17,7 @@ defmodule CrateWrite.Cluster do
       "metadata OBJECT(DYNAMIC)"
     ]
 
-    obj_columns = for i <- 0..(objects - 1), do: "obj_#{i} TEXT"
+    obj_columns = if objects > 0, do: (for i <- 0..(objects - 1), do: "obj_#{i} TEXT"), else: []
     all_columns = base_columns ++ obj_columns
 
     sql = """

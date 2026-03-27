@@ -10,10 +10,14 @@ defmodule CrateWrite.Generator do
 
   def new(num_objects \\ 0) do
     object_values =
-      for i <- 0..(max(num_objects, 1) - 1), into: %{} do
-        cardinality = Enum.random(3..8)
-        vals = for j <- 0..(cardinality - 1), do: "obj#{i}_val_#{j}"
-        {i, vals}
+      if num_objects > 0 do
+        for i <- 0..(num_objects - 1), into: %{} do
+          cardinality = Enum.random(3..8)
+          vals = for j <- 0..(cardinality - 1), do: "obj#{i}_val_#{j}"
+          {i, vals}
+        end
+      else
+        %{}
       end
 
     %__MODULE__{
@@ -48,9 +52,13 @@ defmodule CrateWrite.Generator do
     ]
 
     objects =
-      for i <- 0..(gen.num_objects - 1) do
-        vals = Map.get(gen.object_values, i, ["default_obj_#{i}"])
-        Enum.random(vals)
+      if gen.num_objects > 0 do
+        for i <- 0..(gen.num_objects - 1) do
+          vals = Map.get(gen.object_values, i, ["default_obj_#{i}"])
+          Enum.random(vals)
+        end
+      else
+        []
       end
 
     base ++ objects
