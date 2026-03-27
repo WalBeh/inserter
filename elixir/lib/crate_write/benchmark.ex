@@ -36,6 +36,14 @@ defmodule CrateWrite.Benchmark do
       }
     }
 
+    # Add auto_tune data if present
+    result =
+      if monitor_data[:auto_tune] do
+        Map.put(result, "auto_tune", monitor_data.auto_tune)
+      else
+        result
+      end
+
     # JSONL to stdout (one line)
     IO.puts(Jason.encode!(result))
   end

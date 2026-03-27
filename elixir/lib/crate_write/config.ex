@@ -14,6 +14,8 @@ defmodule CrateWrite.Config do
     compress: true,
     benchmark: false,
     test_loadbalancer: false,
+    auto_tune: false,
+    latency_target: 2.0,
     log_level: "info"
   ]
 
@@ -33,6 +35,8 @@ defmodule CrateWrite.Config do
           test_loadbalancer: :boolean,
           benchmark: :boolean,
           no_compression: :boolean,
+          auto_tune: :boolean,
+          latency_target: :float,
           log_level: :string,
           config: :string
         ]
@@ -90,6 +94,8 @@ defmodule CrateWrite.Config do
         compress: !opts[:no_compression] && config.compress,
         benchmark: opts[:benchmark] || config.benchmark,
         test_loadbalancer: opts[:test_loadbalancer] || config.test_loadbalancer,
+        auto_tune: opts[:auto_tune] || config.auto_tune,
+        latency_target: opts[:latency_target] || config.latency_target,
         log_level: opts[:log_level] || config.log_level
     }
   end

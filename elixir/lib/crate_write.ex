@@ -71,6 +71,9 @@ defmodule CrateWrite do
     # Create generator template
     generator = Generator.new(config.objects)
 
+    # Initialize dynamic batch size (for auto-tune)
+    CrateWrite.GeneratorWorker.init_batch_size(config.batch_size)
+
     # Start generator processes (CPU work — feed the buffer)
     generator_pids =
       for i <- 0..(num_generators - 1) do
@@ -82,24 +85,42 @@ defmodule CrateWrite do
         pid
       end
 
-    # Start sender processes (I/O work — drain the buffer, POST to CrateDB)
-    sender_pids =
+    if config.auto_tune do
+      # Auto-tune mode: PID controller manages senders dynamically
+      latency_target_ms = round(config.latency_target * 1000)
+
+      unless config.benchmark do
+        IO.puts(:stderr, "AUTO-TUNE: starting with 6 senders, target P95 latency #{config.latency_target}s")
+        IO.puts(:stderr, "AUTO-TUNE: max senders=#{num_senders}, max batch=#{config.batch_size}")
+      end
+
+      {:ok, _pid} = CrateWrite.PIDController.start_link(
+        client: client,
+        insert_sql: insert_sql,
+        generator: generator,
+        max_senders: num_senders,
+        max_batch_size: config.batch_size,
+        latency_target_ms: latency_target_ms,
+        batch_interval: config.batch_interval
+      )
+    else
+      # Fixed mode: start all senders immediately
       for i <- 0..(num_senders - 1) do
-        {:ok, pid} = CrateWrite.Sender.start_link(
+        CrateWrite.Sender.start_link(
           sender_id: i,
           client: client,
           insert_sql: insert_sql,
           batch_interval: config.batch_interval
         )
-        pid
       end
 
-    unless config.benchmark do
-      IO.puts(:stderr, "Pipeline running: #{num_generators} generators, #{num_senders} senders")
+      unless config.benchmark do
+        IO.puts(:stderr, "Pipeline running: #{num_generators} generators, #{num_senders} senders")
+      end
     end
 
     # Start reporting/sampling timer
-    quiet = config.benchmark
+    quiet = config.benchmark and not config.auto_tune
     total_workers = num_generators + num_senders
     reporter_pid = spawn(fn -> reporter_loop(total_workers, quiet) end)
 
@@ -114,16 +135,20 @@ defmodule CrateWrite do
         unless config.benchmark, do: IO.puts(:stderr, "Interrupted, stopping pipeline...")
     end
 
-    # Stop generators first (stop producing)
-    for pid <- generator_pids, Process.alive?(pid), do: Process.exit(pid, :shutdown)
+    # Stop PID controller if running
+    if config.auto_tune do
+      pid_state = CrateWrite.PIDController.get_state()
+      Process.whereis(CrateWrite.PIDController) |> Process.exit(:shutdown)
+      # Store for JSON output
+      Process.put(:auto_tune_state, pid_state)
+    end
 
-    # Brief pause for buffer to drain
+    # Stop generators
+    for pid <- generator_pids, Process.alive?(pid), do: Process.exit(pid, :shutdown)
     Process.sleep(1000)
 
-    # Stop senders
-    for pid <- sender_pids, Process.alive?(pid), do: Process.exit(pid, :shutdown)
-
-    # Wait for in-flight requests
+    # Stop any remaining senders (PID controller's senders or fixed senders)
+    # The PID controller's senders are tracked internally — kill by message
     Process.sleep(2000)
 
     # Stop reporter
@@ -155,11 +180,14 @@ defmodule CrateWrite do
       bytes_sent = Monitor.get_total_bytes_sent()
       bandwidth_mbps = Monitor.get_bandwidth_mbps()
 
+      auto_tune_data = Process.get(:auto_tune_state)
+
       monitor_data = %{
         rate_stats: rate_stats,
         latency_stats: latency_stats,
         bytes_sent: bytes_sent,
-        bandwidth_mbps: bandwidth_mbps
+        bandwidth_mbps: bandwidth_mbps,
+        auto_tune: auto_tune_data
       }
 
       Benchmark.output_json(config, cluster_info, final_stats, monitor_data, verification)
