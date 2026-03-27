@@ -45,6 +45,23 @@ asdf global erlang 27.0
 asdf global elixir 1.17.0-otp-27
 ```
 
+### Kubernetes / Docker
+```bash
+# Run a pod with Elixir pre-installed
+kubectl run elixir --image elixir:slim -- sleep infinity
+kubectl exec -it elixir -- bash
+
+# Inside the pod:
+apt update && apt install -y git
+git clone https://github.com/WalBeh/inserter.git && cd inserter/elixir
+echo 'CRATE_CONNECTION_STRING=http://crate@your-cratedb-host:4200' > .env
+mix local.hex --force && mix local.rebar --force
+mix deps.get && mix compile
+
+# When done:
+# kubectl delete pod elixir
+```
+
 ### Verify installation
 ```bash
 elixir --version
