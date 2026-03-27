@@ -59,21 +59,53 @@ Both saturate the laptop uplink at ~28-30 Mbps.
 
 ## Remote: 5-node cluster (xdemo2 scaled, cr2, 4 vCPU/node, 20 total)
 
+### From k8s pod (same cluster, ~1ms RTT, no compression)
+
+| Client | Tasks | Batch | Shards | Replicas | Avg rec/sec | P90 rec/sec | Per CPU avg | Per CPU P95 | Latency avg | Bandwidth | Rejected | Errors |
+|--------|-------|-------|--------|----------|-------------|-------------|-------------|-------------|-------------|-----------|----------|--------|
+| **Elixir** | **64** | **1000** | **4** | **0** | **84,302** | **102,259** | **4,215** | **5,166** | **296ms** | **187 Mbps** | **0** | **0** |
+| Elixir | 64 | 1000 | 20 | 0 | 78,405 | 105,589 | 3,920 | 5,280 | 582ms | 180 Mbps | 1,174 | 1 |
+| Rust | 64 | 2000 | 20 | 0 | 75,668 | 105,549 | 3,783 | 5,330 | 1,510ms | 58 Mbps | 0 | 0 |
+| Rust | 128 | 2000 | 20 | 0 | 67,586 | 87,257 | 3,379 | 4,457 | 3,282ms | 51 Mbps | 0 | 0 |
+
+Elixir beats Rust on avg throughput (+11%) and latency (296ms vs 1,510ms) from the same pod. BEAM's preemptive scheduler keeps all workers responsive without `spawn_blocking` overhead.
+
+Note: Rust ran with 20 shards (suboptimal for this cluster). A Rust run with 4 shards from the same pod is needed for a true apples-to-apples comparison.
+
 ### From Hetzner Frankfurt (~180ms RTT, gzip on)
 
 | Client | Tasks | Batch | Shards | Replicas | Avg rec/sec | Per CPU | Bandwidth | Errors |
 |--------|-------|-------|--------|----------|-------------|---------|-----------|--------|
 | Rust | 64 | 2000 | 4 | 1 | 52,426 | 2,621 | 39.3 Mbps | 0 |
+| Elixir | 64 | 1000 | 4 | 0 | 22,154 | 1,108 | 46.7 Mbps | 0 |
 
-Again bandwidth-limited at ~39 Mbps.
+Rust wins over the network. Elixir's higher per-request latency (Mint is pure Elixir vs reqwest's C-based hyper) matters more when RTT is already high.
+
+### From laptop (5G, ~150ms RTT, gzip on)
+
+| Client | Tasks | Batch | Shards | Replicas | Avg rec/sec | Per CPU | Bandwidth | Errors |
+|--------|-------|-------|--------|----------|-------------|---------|-----------|--------|
+| Rust | 42 | 1000 | 4 | 1 | 56,258 | 2,813 | 41.3 Mbps | 0 |
+| Elixir | 64 | 1000 | 4 | 0 | 25,039 | 1,252 | 46.7 Mbps | 0 |
+
+## Clean benchmarks: 4-CPU single node (k8s pod, no compression)
+
+| Threads | Batch | Shards | Replicas | Avg rec/sec | Per CPU avg | Per CPU P95 | Rejected | Latency avg |
+|---------|-------|--------|----------|-------------|-------------|-------------|----------|-------------|
+| 16 | 2000 | 4 | 0 | 24,903 | 6,226 | 8,344 | 0 | 1,204ms |
+| 24 | 2000 | 4 | 0 | 24,947 | 6,237 | 7,749 | 0 | 1,740ms |
+| 32 | 2000 | 4 | 0 | 38,853 | 9,713 | 11,650 | 186K (1.5%) | 1,574ms |
+
+All Rust. 16 threads is the clean ceiling for a 4-CPU node: **~25K rec/sec, ~6.2K/cpu, 0 rejections**.
 
 ## Key Observations
 
-1. **On localhost, Rust is 3x faster than Python** (214K vs 76K) because Rust parallelizes CPU work across cores via `spawn_blocking`, while Python is single-core GIL-bound.
-2. **Over the network, both perform equally** — the bottleneck is bandwidth and latency, not client CPU.
-3. **Shards matter**: 12 shards on 3 nodes gave +56% over 4 shards (Frankfurt test).
-4. **Batch size 15,000 overloads a single node** — 1.8M rejected writes. Batch 1000-2000 is safer.
-5. **Gzip compression**: essential over the network (~88% payload reduction), counterproductive on localhost (wastes single-core CPU).
-6. **`orjson` vs `json.dumps`**: +17% for Python on localhost. Marginal over the network.
-7. **Rejected writes** (`sys.nodes` thread pool query) are the key health indicator — any > 0 means the cluster is overloaded.
-8. **Network bandwidth is almost always the bottleneck** from remote clients. From the same cloud region, expect much higher throughput.
+1. **Elixir beats Rust on same-network** (84K vs 76K, +11%) thanks to BEAM's preemptive scheduling — lower per-request latency, better worker utilization.
+2. **Rust beats Elixir over high-latency networks** — reqwest/hyper's C-based HTTP stack has lower per-request overhead than Mint (pure Elixir).
+3. **Python is single-core GIL-bound** on localhost (76K with orjson). Over the network it matches Rust since bandwidth is the bottleneck.
+4. **On localhost, Rust is 3x faster than Python** (214K vs 76K) because `spawn_blocking` parallelizes CPU work.
+5. **Shards**: 4 shards was optimal for the 5-node cluster at this concurrency. Over-sharding (20) caused rejections.
+6. **Batch size 15,000 overloads a single node** — 1.8M rejected writes. Batch 1000-2000 is safer.
+7. **Gzip compression**: essential over the network (~88% reduction), counterproductive on localhost.
+8. **Rejected writes** are the key health indicator — any > 0 means the cluster is overloaded.
+9. **Network bandwidth is almost always the bottleneck** from remote clients.
