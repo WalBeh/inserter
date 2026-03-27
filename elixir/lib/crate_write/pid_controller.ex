@@ -138,7 +138,7 @@ defmodule CrateWrite.PIDController do
     if new_rejections > 0 do
       emergency_brake(state, new_rejections)
     else
-      latency_stats = CrateWrite.Monitor.get_latency_stats()
+      latency_stats = CrateWrite.Monitor.get_window_latency_stats()
       current_p95 = latency_stats.p95
 
       if current_p95 == 0 do

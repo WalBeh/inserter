@@ -29,6 +29,8 @@ defmodule CrateWrite.Monitor do
   def get_final_stats, do: GenServer.call(__MODULE__, :get_final_stats)
   def get_percentile_stats, do: GenServer.call(__MODULE__, :get_percentile_stats)
   def get_latency_stats, do: GenServer.call(__MODULE__, :get_latency_stats)
+  @doc "Latency stats from the last window only (for PID controller)."
+  def get_window_latency_stats, do: GenServer.call(__MODULE__, :get_window_latency_stats)
 
   def get_bandwidth_mbps do
     bytes = :ets.lookup_element(@table, :total_bytes_sent, 2)
@@ -70,13 +72,17 @@ defmodule CrateWrite.Monitor do
        last_report_time: now,
        last_report_records: 0,
        rate_samples: [],
-       latency_samples: []
+       latency_samples: [],
+       window_latency_samples: []
      }}
   end
 
   @impl true
   def handle_cast({:latency_sample, latency_ms}, state) do
-    {:noreply, %{state | latency_samples: [latency_ms | state.latency_samples]}}
+    {:noreply, %{state |
+      latency_samples: [latency_ms | state.latency_samples],
+      window_latency_samples: [latency_ms | state.window_latency_samples]
+    }}
   end
 
   @impl true
@@ -144,6 +150,12 @@ defmodule CrateWrite.Monitor do
 
   def handle_call(:get_latency_stats, _from, state) do
     {:reply, compute_percentiles(state.latency_samples), state}
+  end
+
+  def handle_call(:get_window_latency_stats, _from, state) do
+    stats = compute_percentiles(state.window_latency_samples)
+    # Reset window after reading — next call gets only fresh samples
+    {:reply, stats, %{state | window_latency_samples: []}}
   end
 
   def handle_call({:get_bandwidth_mbps, bytes}, _from, state) do
