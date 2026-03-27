@@ -46,7 +46,18 @@ defmodule CrateWrite.Config do
     end
 
     if env_file do
-      Dotenvy.source!([env_file, System.get_env()])
+      env_file
+      |> File.read!()
+      |> String.split("\n")
+      |> Enum.each(fn line ->
+        line = String.trim(line)
+        unless line == "" or String.starts_with?(line, "#") do
+          case String.split(line, "=", parts: 2) do
+            [key, val] -> System.put_env(String.trim(key), String.trim(val))
+            _ -> :ok
+          end
+        end
+      end)
     end
 
     # Start with defaults

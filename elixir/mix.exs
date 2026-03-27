@@ -27,8 +27,7 @@ defmodule CrateWrite.MixProject do
     [
       {:finch, "~> 0.18"},
       {:jason, "~> 1.4"},
-      {:elixir_uuid, "~> 1.2"},
-      {:dotenvy, "~> 0.8"}
+      {:elixir_uuid, "~> 1.2"}
     ]
   end
 end
