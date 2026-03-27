@@ -619,6 +619,7 @@ async def run_async_engine(
                     **monitor.get_network_stats(),
                     "verified_count": verified_count,
                     "rejected_writes": rejected_writes,
+                    "rejected_pct": round((rejected_writes / max(final_stats["total_records"], 1)) * 100, 2),
                 },
             }
             # JSONL to stdout (one line, appendable)
@@ -628,7 +629,8 @@ async def run_async_engine(
             # Summary to stderr for quick reading
             version = cluster_info.get("version", "?")
             p90_total = rate_stats.get('p90', 0)
-            rej = f" | REJECTED: {rejected_writes}" if rejected_writes > 0 else ""
+            rej_pct = (rejected_writes / max(final_stats["total_records"], 1)) * 100
+            rej = f" | REJECTED: {rejected_writes} ({rej_pct:.1f}%)" if rejected_writes > 0 else ""
             print(f"CrateDB {version} | {total_cpus} CPUs | p90={p90_total:.0f} rec/s | per CPU: avg={per_cpu['avg']:.0f} p95={per_cpu['p95']:.0f} max={per_cpu['max']:.0f}{rej}", file=sys.stderr)
         else:
             # Normal mode: human-readable output
