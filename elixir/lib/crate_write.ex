@@ -144,9 +144,13 @@ defmodule CrateWrite do
       end
       Process.put(:auto_tune_state, pid_state)
 
-      case Process.whereis(CrateWrite.PIDController) do
-        nil -> :ok
-        pid -> GenServer.stop(pid, :normal, 5000) rescue _ -> :ok
+      try do
+        case Process.whereis(CrateWrite.PIDController) do
+          nil -> :ok
+          pid -> GenServer.stop(pid, :normal, 5000)
+        end
+      catch
+        _, _ -> :ok
       end
     end
 
