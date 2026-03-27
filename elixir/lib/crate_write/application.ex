@@ -14,9 +14,11 @@ defmodule CrateWrite.Application do
   end
 
   def start_finch(pool_size) do
+    # Multiple pool instances for better parallelism under high concurrency
+    pool_count = max(div(pool_size, 16), 1)
     Finch.start_link(
       name: CrateWrite.Finch,
-      pools: %{default: [size: pool_size, count: 1]}
+      pools: %{default: [size: pool_size, count: pool_count]}
     )
   end
 end
