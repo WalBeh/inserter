@@ -36,6 +36,10 @@ defmodule CrateWrite do
       IO.puts(:stderr, "Compression: #{if config.compress, do: "gzip", else: "off"}")
     end
 
+    # Start Finch with pool sized to thread count
+    pool_size = max(config.threads + 2, 10)
+    CrateWrite.Application.start_finch(pool_size)
+
     # Create client
     client = Client.new(config.connection_string, compress: config.compress)
 
