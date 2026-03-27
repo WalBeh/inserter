@@ -6,7 +6,7 @@ defmodule CrateWrite.Sender do
   require Logger
 
   def start_link(opts) do
-    pid = spawn_link(fn -> loop(opts) end)
+    pid = spawn(fn -> loop(opts) end)
     {:ok, pid}
   end
 
