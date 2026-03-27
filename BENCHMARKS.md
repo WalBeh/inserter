@@ -59,18 +59,30 @@ Both saturate the laptop uplink at ~28-30 Mbps.
 
 ## Remote: 5-node cluster (xdemo2 scaled, cr2, 4 vCPU/node, 20 total)
 
-### From k8s pod (same cluster, ~1ms RTT, no compression)
+### From k8s pod (same cluster, ~1ms RTT)
 
-| Client | Tasks | Batch | Shards | Replicas | Avg rec/sec | P90 rec/sec | Per CPU avg | Per CPU P95 | Latency avg | Bandwidth | Rejected | Errors |
-|--------|-------|-------|--------|----------|-------------|-------------|-------------|-------------|-------------|-----------|----------|--------|
-| **Elixir** | **64** | **1000** | **4** | **0** | **84,302** | **102,259** | **4,215** | **5,166** | **296ms** | **187 Mbps** | **0** | **0** |
-| Elixir | 64 | 1000 | 20 | 0 | 78,405 | 105,589 | 3,920 | 5,280 | 582ms | 180 Mbps | 1,174 | 1 |
-| Rust | 64 | 2000 | 20 | 0 | 75,668 | 105,549 | 3,783 | 5,330 | 1,510ms | 58 Mbps | 0 | 0 |
-| Rust | 128 | 2000 | 20 | 0 | 67,586 | 87,257 | 3,379 | 4,457 | 3,282ms | 51 Mbps | 0 | 0 |
+#### Apples-to-apples: 64 threads, batch 1000, 4 shards, replicas=0, no compression
 
-Elixir beats Rust on avg throughput (+11%) and latency (296ms vs 1,510ms) from the same pod. BEAM's preemptive scheduler keeps all workers responsive without `spawn_blocking` overhead.
+| Client | Avg rec/sec | P90 rec/sec | Per CPU avg | Per CPU P95 | Latency avg | Bandwidth | Rejected |
+|--------|-------------|-------------|-------------|-------------|-------------|-----------|----------|
+| **Rust** | **96,650** | **119,391** | **4,833** | **6,175** | **621ms** | **213 Mbps** | **0** |
+| Elixir (pipeline) | 91,269 | 108,389 | 4,564 | 5,528 | 398ms | 181 Mbps | 0 |
+| Elixir (coupled) | 84,302 | 102,259 | 4,215 | 5,166 | 296ms | 187 Mbps | 0 |
 
-Note: Rust ran with 20 shards (suboptimal for this cluster). A Rust run with 4 shards from the same pod is needed for a true apples-to-apples comparison.
+Rust wins by ~6% on avg, ~10% on P90. The gap is JSON serialization throughput: Rust's `spawn_blocking` parallelizes serde across CPU cores (213 Mbps), while Elixir's Jason runs per-sender-process (181 Mbps). Elixir has lower per-request latency but can't fill the pipe as fast.
+
+The pipeline architecture gave Elixir +8% over the coupled approach by decoupling CPU (generation) from I/O (sending).
+
+#### Other configurations
+
+| Client | Tasks | Batch | Shards | Replicas | Compress | Avg rec/sec | Per CPU avg | Bandwidth | Rejected |
+|--------|-------|-------|--------|----------|----------|-------------|-------------|-----------|----------|
+| Rust (gzip) | 64 | 2000 | 4 | 0 | yes | 99,891 | 4,995 | 75.6 Mbps | 0 |
+| Elixir (gzip) | 64 | 1000 | 4 | 0 | yes | 79,044 | 3,952 | 45.0 Mbps | 0 |
+| Elixir | 64 | 1000 | 20 | 0 | no | 78,405 | 3,920 | 180 Mbps | 1,174 |
+| Rust | 64 | 2000 | 20 | 0 | yes | 75,668 | 3,783 | 58 Mbps | 0 |
+
+Gzip costs ~13% throughput on same-network (CPU overhead without bandwidth benefit). 20 shards caused rejections on this cluster — 4 shards is optimal.
 
 ### From Hetzner Frankfurt (~180ms RTT, gzip on)
 
