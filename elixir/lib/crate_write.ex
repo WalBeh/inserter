@@ -101,7 +101,8 @@ defmodule CrateWrite do
         max_senders: num_senders,
         max_batch_size: config.batch_size,
         latency_target_ms: latency_target_ms,
-        batch_interval: config.batch_interval
+        batch_interval: config.batch_interval,
+        mode: config.auto_tune_mode
       )
     else
       # Fixed mode: start all senders immediately

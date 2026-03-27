@@ -15,6 +15,7 @@ defmodule CrateWrite.Config do
     benchmark: false,
     test_loadbalancer: false,
     auto_tune: false,
+    auto_tune_mode: "latency",
     latency_target: 2.0,
     log_level: "info"
   ]
@@ -36,6 +37,7 @@ defmodule CrateWrite.Config do
           benchmark: :boolean,
           no_compression: :boolean,
           auto_tune: :boolean,
+          auto_tune_mode: :string,
           latency_target: :float,
           log_level: :string,
           config: :string
@@ -95,6 +97,7 @@ defmodule CrateWrite.Config do
         benchmark: opts[:benchmark] || config.benchmark,
         test_loadbalancer: opts[:test_loadbalancer] || config.test_loadbalancer,
         auto_tune: opts[:auto_tune] || config.auto_tune,
+        auto_tune_mode: opts[:auto_tune_mode] || config.auto_tune_mode,
         latency_target: opts[:latency_target] || config.latency_target,
         log_level: opts[:log_level] || config.log_level
     }

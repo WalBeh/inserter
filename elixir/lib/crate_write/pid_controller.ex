@@ -16,6 +16,7 @@ defmodule CrateWrite.PIDController do
     :max_batch_size,
     :latency_target_ms,
     :batch_interval,
+    :mode,  # "latency" or "rejections"
     # State
     :current_senders,
     :current_batch_size,
@@ -60,6 +61,7 @@ defmodule CrateWrite.PIDController do
       max_batch_size: opts[:max_batch_size],
       latency_target_ms: opts[:latency_target_ms],
       batch_interval: opts[:batch_interval],
+      mode: opts[:mode] || "latency",
       current_senders: @initial_senders,
       current_batch_size: @initial_batch_size,
       sender_pids: [],
@@ -78,7 +80,8 @@ defmodule CrateWrite.PIDController do
     CrateWrite.GeneratorWorker.set_batch_size(@initial_batch_size)
     state = spawn_n_senders(state, @initial_senders)
 
-    IO.write(:stderr, "AUTO-TUNE: PROBE start senders=#{@initial_senders} batch=#{@initial_batch_size} target=#{state.latency_target_ms}ms\n")
+    mode_label = if state.mode == "rejections", do: "rejections-only", else: "latency target=#{state.latency_target_ms}ms"
+    IO.write(:stderr, "AUTO-TUNE: PROBE start senders=#{@initial_senders} batch=#{@initial_batch_size} mode=#{mode_label}\n")
 
     Process.send_after(self(), :control_tick, @control_interval_ms)
     {:ok, state}
@@ -96,6 +99,7 @@ defmodule CrateWrite.PIDController do
     result = %{
       enabled: true,
       algorithm: "bisect",
+      mode: state.mode,
       latency_target_ms: state.latency_target_ms,
       initial_senders: @initial_senders,
       initial_batch_size: @initial_batch_size,
@@ -134,32 +138,39 @@ defmodule CrateWrite.PIDController do
   # Ramp up aggressively until P95 exceeds target. This finds the cliff.
 
   defp probe(state) do
-    latency = CrateWrite.Monitor.get_window_latency_stats()
-    p95 = latency.p95
-
-    if p95 == 0 do
-      # No data yet — keep ramping
+    if state.mode == "rejections" do
+      # Rejections mode: just keep ramping, cliff is found only via emergency_brake
+      state = %{state | good: state.current_senders}
       ramp_up(state)
     else
-      if p95 > state.latency_target_ms do
-        # Found the cliff! Current count is bad, previous was good
-        bad = state.current_senders
-        good = state.good
+      # Latency mode: check P95 against target
+      latency = CrateWrite.Monitor.get_window_latency_stats()
+      p95 = latency.p95
 
-        IO.write(:stderr, "AUTO-TUNE: CLIFF at #{bad} senders (p95=#{round(p95)}ms) — bisecting [#{good}, #{bad}]\n")
-
-        # Enter bisection, try the midpoint
-        mid = div(good + bad, 2)
-        IO.write(:stderr, "AUTO-TUNE: BISECT next=#{mid} (bounds=[#{good}, #{bad}])\n")
-
-        state = set_senders(%{state | phase: :bisect, bad: bad, good: good}, mid)
-        %{state | adjustments: state.adjustments + 1}
-      else
-        # Under target — this count is good, keep probing
-        state = %{state | good: state.current_senders}
+      if p95 == 0 do
         ramp_up(state)
+      else
+        if p95 > state.latency_target_ms do
+          enter_bisect(state, p95)
+        else
+          state = %{state | good: state.current_senders}
+          ramp_up(state)
+        end
       end
     end
+  end
+
+  defp enter_bisect(state, p95) do
+    bad = state.current_senders
+    good = state.good
+
+    IO.write(:stderr, "AUTO-TUNE: CLIFF at #{bad} senders (p95=#{round(p95)}ms) — bisecting [#{good}, #{bad}]\n")
+
+    mid = div(good + bad, 2)
+    IO.write(:stderr, "AUTO-TUNE: BISECT next=#{mid} (bounds=[#{good}, #{bad}])\n")
+
+    state = set_senders(%{state | phase: :bisect, bad: bad, good: good}, mid)
+    %{state | adjustments: state.adjustments + 1}
   end
 
   defp ramp_up(state) do
@@ -186,6 +197,29 @@ defmodule CrateWrite.PIDController do
   # Binary search between good (under target) and bad (over target).
 
   defp bisect(state) do
+    if state.mode == "rejections" do
+      # In rejections mode, bisect just waits — the emergency_brake sets bounds
+      # If no rejections, current count is OK
+      good = max(state.current_senders, state.good)
+      IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} OK (no rejections) bounds=[#{good}, #{state.bad}]\n")
+
+      range = state.bad - good
+      if range <= 2 do
+        IO.write(:stderr, "AUTO-TUNE: CONVERGED → #{good} senders (batch=#{state.current_batch_size})\n")
+        state = set_senders(%{state | good: good}, good)
+        %{state | phase: :hold, adjustments: state.adjustments + 1}
+      else
+        mid = div(good + state.bad, 2)
+        IO.write(:stderr, "AUTO-TUNE: BISECT next=#{mid} (bounds=[#{good}, #{state.bad}])\n")
+        state = set_senders(%{state | good: good}, mid)
+        %{state | adjustments: state.adjustments + 1}
+      end
+    else
+      bisect_latency(state)
+    end
+  end
+
+  defp bisect_latency(state) do
     latency = CrateWrite.Monitor.get_window_latency_stats()
     p95 = latency.p95
 
