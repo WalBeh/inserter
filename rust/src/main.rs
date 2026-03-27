@@ -183,7 +183,7 @@ async fn run_data_generation(
     // Query cluster info
     let cluster_info = query_cluster_info(&client).await;
 
-    // Get pre-existing record count
+    // Get pre-existing record count and rejected writes baseline
     let pre_count = {
         let _ = client.execute(&format!("REFRESH TABLE {}", table_name), &[]).await;
         client.execute_query(&format!("SELECT COUNT(*) FROM {}", table_name)).await
@@ -191,6 +191,9 @@ async fn run_data_generation(
             .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64())))
             .unwrap_or(0)
     };
+    let pre_rejected = client.execute_query(
+        "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
+    ).await.ok().and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64()))).unwrap_or(0);
 
     // Prepare insert statement
     let mut placeholders = vec!["?"; 10]; // Base fields
@@ -341,13 +344,11 @@ async fn run_data_generation(
         post_count.saturating_sub(pre_count)
     };
 
-    // Check for rejected writes
-    let rejected_writes = client.execute_query(
+    // Check for rejected writes (delta from pre-run baseline)
+    let post_rejected = client.execute_query(
         "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
-    ).await
-        .ok()
-        .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64())))
-        .unwrap_or(0);
+    ).await.ok().and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64()))).unwrap_or(0);
+    let rejected_writes = post_rejected.saturating_sub(pre_rejected);
 
     if benchmark {
         // Benchmark mode: JSONL to stdout

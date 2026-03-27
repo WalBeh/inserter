@@ -521,12 +521,20 @@ async def run_async_engine(
         # Query cluster info (needed for benchmark JSON)
         cluster_info = await query_cluster_info(client)
 
-        # Get pre-existing record count for verification
+        # Get pre-existing record count and rejected writes baseline
         pre_count = 0
+        pre_rejected = 0
         try:
             r = await client.execute(f"REFRESH TABLE {table_name}")
             r = await client.execute(f"SELECT COUNT(*) FROM {table_name}")
             pre_count = r.get("rows", [[0]])[0][0]
+        except Exception:
+            pass
+        try:
+            r = await client.execute(
+                "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
+            )
+            pre_rejected = r.get("rows", [[0]])[0][0] or 0
         except Exception:
             pass
 
@@ -579,13 +587,14 @@ async def run_async_engine(
         except Exception as e:
             logger.warning(f"Failed to verify record count: {e}")
 
-        # Check for rejected writes
+        # Check for rejected writes (delta from pre-run baseline)
         rejected_writes = 0
         try:
             result = await client.execute(
                 "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
             )
-            rejected_writes = result.get("rows", [[0]])[0][0] or 0
+            post_rejected = result.get("rows", [[0]])[0][0] or 0
+            rejected_writes = max(0, post_rejected - pre_rejected)
         except Exception as e:
             logger.warning(f"Failed to query rejected writes: {e}")
 
