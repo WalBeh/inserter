@@ -6,6 +6,7 @@ defmodule CrateWrite.Application do
     # Pool size will be reconfigured before workers start
     children = [
       CrateWrite.Monitor,
+      CrateWrite.BatchBuffer,
       {DynamicSupervisor, name: CrateWrite.WorkerSupervisor, strategy: :one_for_one}
     ]
 

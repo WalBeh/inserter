@@ -1,8 +1,8 @@
 defmodule CrateWrite do
-  @moduledoc "CrateDB record generator and inserter — Elixir implementation."
+  @moduledoc "CrateDB record generator and inserter — Elixir pipeline implementation."
   require Logger
 
-  alias CrateWrite.{Config, Client, Cluster, Generator, Monitor, Worker, Benchmark}
+  alias CrateWrite.{Config, Client, Cluster, Generator, Monitor, Benchmark}
 
   def main(args \\ nil) do
     args = args || System.argv()
@@ -25,19 +25,24 @@ defmodule CrateWrite do
     # Validate
     config = Config.validate!(config)
 
+    # Calculate pipeline sizing: N generators feed M senders through a buffer
+    # Use ~1/4 of threads for generation, ~3/4 for sending (I/O bound)
+    num_generators = max(div(config.threads, 4), 1)
+    num_senders = max(config.threads - num_generators, 1)
+
     unless config.benchmark do
-      IO.puts(:stderr, "Starting CrateDB record generator (Elixir/BEAM)")
+      IO.puts(:stderr, "Starting CrateDB record generator (Elixir/BEAM pipeline)")
       IO.puts(:stderr, "Connection: #{Config.sanitize_connection_string(config.connection_string)}")
       IO.puts(:stderr, "Table: #{config.table_name}")
       IO.puts(:stderr, "Duration: #{config.duration} minutes")
       IO.puts(:stderr, "Batch size: #{config.batch_size}")
       IO.puts(:stderr, "Batch interval: #{config.batch_interval}ms")
-      IO.puts(:stderr, "Worker processes: #{config.threads}")
+      IO.puts(:stderr, "Pipeline: #{num_generators} generators → buffer → #{num_senders} senders")
       IO.puts(:stderr, "Compression: #{if config.compress, do: "gzip", else: "off"}")
     end
 
-    # Start Finch with pool sized to thread count
-    pool_size = max(config.threads + 2, 10)
+    # Start Finch with pool sized to sender count
+    pool_size = max(num_senders + 2, 10)
     CrateWrite.Application.start_finch(pool_size)
 
     # Create client
@@ -66,49 +71,59 @@ defmodule CrateWrite do
     # Create generator template
     generator = Generator.new(config.objects)
 
-    # Start workers
-    worker_pids =
-      for i <- 0..(config.threads - 1) do
-        {:ok, pid} =
-          DynamicSupervisor.start_child(CrateWrite.WorkerSupervisor, {
-            Worker,
-            worker_id: i,
-            client: client,
-            generator: generator,
-            insert_sql: insert_sql,
-            batch_size: config.batch_size,
-            batch_interval: config.batch_interval
-          })
+    # Start generator processes (CPU work — feed the buffer)
+    generator_pids =
+      for i <- 0..(num_generators - 1) do
+        {:ok, pid} = CrateWrite.GeneratorWorker.start_link(
+          generator_id: i,
+          generator: generator,
+          batch_size: config.batch_size
+        )
+        pid
+      end
 
+    # Start sender processes (I/O work — drain the buffer, POST to CrateDB)
+    sender_pids =
+      for i <- 0..(num_senders - 1) do
+        {:ok, pid} = CrateWrite.Sender.start_link(
+          sender_id: i,
+          client: client,
+          insert_sql: insert_sql,
+          batch_interval: config.batch_interval
+        )
         pid
       end
 
     unless config.benchmark do
-      IO.puts(:stderr, "Started #{config.threads} worker processes...")
+      IO.puts(:stderr, "Pipeline running: #{num_generators} generators, #{num_senders} senders")
     end
 
-    # Start reporting/sampling timer (always runs to collect rate samples)
+    # Start reporting/sampling timer
     quiet = config.benchmark
-    reporter_pid =
-      spawn(fn -> reporter_loop(config.threads, quiet) end)
+    total_workers = num_generators + num_senders
+    reporter_pid = spawn(fn -> reporter_loop(total_workers, quiet) end)
 
-    # Wait for duration or Ctrl+C
+    # Wait for duration
     duration_ms = config.duration * 60_000
 
     try do
       Process.sleep(duration_ms)
-      unless config.benchmark, do: IO.puts(:stderr, "Duration completed, stopping workers...")
+      unless config.benchmark, do: IO.puts(:stderr, "Duration completed, stopping pipeline...")
     catch
       :exit, _ ->
-        unless config.benchmark, do: IO.puts(:stderr, "Interrupted, stopping workers...")
+        unless config.benchmark, do: IO.puts(:stderr, "Interrupted, stopping pipeline...")
     end
 
-    # Stop workers
-    for pid <- worker_pids do
-      if Process.alive?(pid), do: send(pid, :shutdown)
-    end
+    # Stop generators first (stop producing)
+    for pid <- generator_pids, Process.alive?(pid), do: Process.exit(pid, :shutdown)
 
-    # Wait for in-flight requests to drain
+    # Brief pause for buffer to drain
+    Process.sleep(1000)
+
+    # Stop senders
+    for pid <- sender_pids, Process.alive?(pid), do: Process.exit(pid, :shutdown)
+
+    # Wait for in-flight requests
     Process.sleep(2000)
 
     # Stop reporter
@@ -154,7 +169,7 @@ defmodule CrateWrite do
     end
   end
 
-  defp reporter_loop(num_threads, quiet) do
+  defp reporter_loop(num_workers, quiet) do
     Process.sleep(10_000)
     stats = Monitor.get_current_stats()
 
@@ -164,11 +179,11 @@ defmodule CrateWrite do
           "#{Float.round(stats.average_rate, 1)} records/sec (avg), " <>
           "Total: #{stats.total_records} records, " <>
           "Batches: #{stats.total_batches}, " <>
-          "Workers: #{num_threads}, " <>
+          "Workers: #{num_workers}, " <>
           "Errors: #{stats.total_errors}"
       )
     end
 
-    reporter_loop(num_threads, quiet)
+    reporter_loop(num_workers, quiet)
   end
 end

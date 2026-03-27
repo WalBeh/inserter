@@ -1,10 +1,15 @@
 defmodule CrateWrite.Generator do
-  @moduledoc "Record generator with same schema and cardinality as Rust/Python implementations."
+  @moduledoc "Record generator with pre-cached strings for maximum throughput."
 
   @regions ["us-east", "us-west", "eu-central", "ap-southeast"]
   @product_categories ["electronics", "books", "clothing", "home", "sports"]
   @event_types ["view", "click", "purchase", "cart_add", "cart_remove"]
   @user_segments ["premium", "standard", "basic", "trial"]
+
+  # Pre-cached strings — no string interpolation in hot path
+  @browsers Enum.map(1..5, &"Browser-#{&1}")
+  @oses Enum.map(1..3, &"OS-#{&1}")
+  @referrers Enum.map(1..10, &"ref-#{&1}")
 
   defstruct [:object_values, :num_objects]
 
@@ -27,20 +32,17 @@ defmodule CrateWrite.Generator do
   end
 
   def generate_record(%__MODULE__{} = gen) do
-    id = UUID.uuid4()
-    timestamp = DateTime.utc_now() |> DateTime.to_iso8601()
-
     metadata = %{
-      "browser" => "Browser-#{Enum.random(1..5)}",
-      "os" => "OS-#{Enum.random(1..3)}",
+      "browser" => Enum.random(@browsers),
+      "os" => Enum.random(@oses),
       "session_id" => UUID.uuid4(),
       "page_views" => Enum.random(1..20),
-      "referrer" => "ref-#{Enum.random(1..10)}"
+      "referrer" => Enum.random(@referrers)
     }
 
     base = [
-      id,
-      timestamp,
+      UUID.uuid4(),
+      DateTime.utc_now() |> DateTime.to_iso8601(),
       Enum.random(@regions),
       Enum.random(@product_categories),
       Enum.random(@event_types),
@@ -51,17 +53,17 @@ defmodule CrateWrite.Generator do
       metadata
     ]
 
-    objects =
-      if gen.num_objects > 0 do
+    if gen.num_objects > 0 do
+      objects =
         for i <- 0..(gen.num_objects - 1) do
           vals = Map.get(gen.object_values, i, ["default_obj_#{i}"])
           Enum.random(vals)
         end
-      else
-        []
-      end
 
-    base ++ objects
+      base ++ objects
+    else
+      base
+    end
   end
 
   def generate_batch(%__MODULE__{} = gen, batch_size) do
