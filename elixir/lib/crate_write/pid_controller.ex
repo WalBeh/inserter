@@ -195,15 +195,18 @@ defmodule CrateWrite.PIDController do
       # No data yet for this sender count — wait
       state
     else
-      if p95 > state.latency_target_ms do
-        # This count is too high
-        state = %{state | bad: state.current_senders}
-        IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} TOO HIGH (p95=#{round(p95)}ms) range=[#{state.good}, #{state.bad}]\n")
-      else
-        # This count is fine
-        state = %{state | good: state.current_senders}
-        IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} OK (p95=#{round(p95)}ms) range=[#{state.good}, #{state.bad}]\n")
-      end
+      # Use 20% tolerance: only "too high" if clearly over target
+      # This prevents flip-flopping at the exact boundary
+      state =
+        if p95 > state.latency_target_ms * 1.2 do
+          new_state = %{state | bad: state.current_senders}
+          IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} TOO HIGH (p95=#{round(p95)}ms) range=[#{new_state.good}, #{new_state.bad}]\n")
+          new_state
+        else
+          new_state = %{state | good: state.current_senders}
+          IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} OK (p95=#{round(p95)}ms) range=[#{new_state.good}, #{new_state.bad}]\n")
+          new_state
+        end
 
       bisect_step(state)
     end
