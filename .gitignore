@@ -193,5 +193,8 @@ bench-key.pem
 # Rust config (may contain credentials)
 rust/config.toml
 
+# Elixir lib (override global lib/ ignore)
+!elixir/lib/
+
 # Claude working notes
 progress_log.md
