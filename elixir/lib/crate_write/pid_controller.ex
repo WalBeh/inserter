@@ -192,48 +192,38 @@ defmodule CrateWrite.PIDController do
     p95 = latency.p95
 
     if p95 == 0 do
-      # No data yet for this sender count — wait
       state
     else
-      # Use 20% tolerance: only "too high" if clearly over target
-      # This prevents flip-flopping at the exact boundary
-      state =
-        if p95 > state.latency_target_ms * 1.2 do
-          new_state = %{state | bad: state.current_senders}
-          IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} TOO HIGH (p95=#{round(p95)}ms) range=[#{new_state.good}, #{new_state.bad}]\n")
-          new_state
+      # Classify current sender count
+      too_high = p95 > state.latency_target_ms * 1.2
+
+      {good, bad} =
+        if too_high do
+          # Current count is too many — it becomes the new upper bound
+          {state.good, min(state.current_senders, state.bad || state.current_senders)}
         else
-          new_state = %{state | good: state.current_senders}
-          IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} OK (p95=#{round(p95)}ms) range=[#{new_state.good}, #{new_state.bad}]\n")
-          new_state
+          # Current count is fine — it becomes the new lower bound
+          {max(state.current_senders, state.good), state.bad}
         end
 
-      bisect_step(state)
-    end
-  end
+      label = if too_high, do: "HIGH", else: "OK"
+      IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} #{label} (p95=#{round(p95)}ms) bounds=[#{good}, #{bad}]\n")
 
-  defp bisect_step(state) do
-    range = state.bad - state.good
+      range = bad - good
 
-    if range <= 2 do
-      # Converged — use the good value
-      IO.write(:stderr, "AUTO-TUNE: CONVERGED → #{state.good} senders (batch=#{state.current_batch_size})\n")
-
-      stats = CrateWrite.Monitor.get_current_stats()
-
-      state = set_senders(state, state.good)
-      %{state |
-        phase: :hold,
-        hold_throughput: stats.current_rate,
-        adjustments: state.adjustments + 1
-      }
-    else
-      # Try the midpoint
-      mid = div(state.good + state.bad, 2)
-      IO.write(:stderr, "AUTO-TUNE: BISECT trying #{mid} senders (range=[#{state.good}, #{state.bad}])\n")
-
-      state = set_senders(state, mid)
-      %{state | adjustments: state.adjustments + 1}
+      if range <= 2 do
+        # Converged
+        IO.write(:stderr, "AUTO-TUNE: CONVERGED → #{good} senders (batch=#{state.current_batch_size})\n")
+        stats = CrateWrite.Monitor.get_current_stats()
+        state = set_senders(%{state | good: good, bad: bad}, good)
+        %{state | phase: :hold, hold_throughput: stats.current_rate, adjustments: state.adjustments + 1}
+      else
+        # Try midpoint
+        mid = div(good + bad, 2)
+        IO.write(:stderr, "AUTO-TUNE: BISECT next=#{mid} (bounds=[#{good}, #{bad}])\n")
+        state = set_senders(%{state | good: good, bad: bad}, mid)
+        %{state | adjustments: state.adjustments + 1}
+      end
     end
   end
 
