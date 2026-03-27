@@ -119,8 +119,8 @@ defmodule CrateWrite do
       end
     end
 
-    # Start reporting/sampling timer
-    quiet = config.benchmark and not config.auto_tune
+    # Start reporting/sampling timer (auto-tune logs its own output)
+    quiet = config.benchmark
     total_workers = num_generators + num_senders
     reporter_pid = spawn(fn -> reporter_loop(total_workers, quiet) end)
 
@@ -137,22 +137,26 @@ defmodule CrateWrite do
 
     # Stop PID controller if running
     if config.auto_tune do
-      pid_state = CrateWrite.PIDController.get_state()
-      Process.whereis(CrateWrite.PIDController) |> Process.exit(:shutdown)
-      # Store for JSON output
+      pid_state = try do
+        CrateWrite.PIDController.get_state()
+      catch
+        _, _ -> nil
+      end
       Process.put(:auto_tune_state, pid_state)
+
+      case Process.whereis(CrateWrite.PIDController) do
+        nil -> :ok
+        pid -> GenServer.stop(pid, :normal, 5000) rescue _ -> :ok
+      end
     end
 
     # Stop generators
-    for pid <- generator_pids, Process.alive?(pid), do: Process.exit(pid, :shutdown)
-    Process.sleep(1000)
-
-    # Stop any remaining senders (PID controller's senders or fixed senders)
-    # The PID controller's senders are tracked internally — kill by message
-    Process.sleep(2000)
+    for pid <- generator_pids, Process.alive?(pid), do: Process.exit(pid, :kill)
+    Process.sleep(500)
 
     # Stop reporter
-    if Process.alive?(reporter_pid), do: Process.exit(reporter_pid, :shutdown)
+    if reporter_pid && Process.alive?(reporter_pid), do: Process.exit(reporter_pid, :kill)
+    Process.sleep(1000)
 
     # Collect final rate sample
     Monitor.get_current_stats()
