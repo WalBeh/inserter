@@ -26,6 +26,7 @@ defmodule CrateWrite.MixProject do
   defp deps do
     [
       {:finch, "~> 0.18"},
+      {:mint, "~> 1.7", override: true},
       {:jason, "~> 1.4"},
       {:elixir_uuid, "~> 1.2"}
     ]
