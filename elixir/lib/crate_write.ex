@@ -4,7 +4,8 @@ defmodule CrateWrite do
 
   alias CrateWrite.{Config, Client, Cluster, Generator, Monitor, Worker, Benchmark}
 
-  def main(args \\ []) do
+  def main(args \\ nil) do
+    args = args || System.argv()
     config = Config.from_cli(args)
 
     # Set log level
