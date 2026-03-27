@@ -87,11 +87,9 @@ defmodule CrateWrite do
       IO.puts(:stderr, "Started #{config.threads} worker processes...")
     end
 
-    # Start reporting timer (unless benchmark mode)
+    # Start reporting/sampling timer (always runs to collect rate samples)
     reporter_pid =
-      unless config.benchmark do
-        spawn_link(fn -> reporter_loop(config.threads) end)
-      end
+      spawn_link(fn -> reporter_loop(config.threads, config.benchmark) end)
 
     # Wait for duration or Ctrl+C
     duration_ms = config.duration * 60_000
@@ -113,7 +111,7 @@ defmodule CrateWrite do
     Process.sleep(2000)
 
     # Stop reporter
-    if reporter_pid && Process.alive?(reporter_pid), do: Process.exit(reporter_pid, :shutdown)
+    if Process.alive?(reporter_pid), do: Process.exit(reporter_pid, :shutdown)
 
     # Collect final rate sample
     Monitor.get_current_stats()
@@ -155,19 +153,21 @@ defmodule CrateWrite do
     end
   end
 
-  defp reporter_loop(num_threads) do
+  defp reporter_loop(num_threads, quiet \\ false) do
     Process.sleep(10_000)
     stats = Monitor.get_current_stats()
 
-    IO.puts(:stderr,
-      "Performance: #{Float.round(stats.current_rate, 1)} records/sec (current), " <>
-        "#{Float.round(stats.average_rate, 1)} records/sec (avg), " <>
-        "Total: #{stats.total_records} records, " <>
-        "Batches: #{stats.total_batches}, " <>
-        "Workers: #{num_threads}, " <>
-        "Errors: #{stats.total_errors}"
-    )
+    unless quiet do
+      IO.puts(:stderr,
+        "Performance: #{Float.round(stats.current_rate, 1)} records/sec (current), " <>
+          "#{Float.round(stats.average_rate, 1)} records/sec (avg), " <>
+          "Total: #{stats.total_records} records, " <>
+          "Batches: #{stats.total_batches}, " <>
+          "Workers: #{num_threads}, " <>
+          "Errors: #{stats.total_errors}"
+      )
+    end
 
-    reporter_loop(num_threads)
+    reporter_loop(num_threads, quiet)
   end
 end
