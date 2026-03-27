@@ -109,8 +109,8 @@ defmodule CrateWrite do
       if Process.alive?(pid), do: send(pid, :shutdown)
     end
 
-    # Brief pause for in-flight requests to complete
-    Process.sleep(500)
+    # Wait for in-flight requests to drain
+    Process.sleep(2000)
 
     # Stop reporter
     if reporter_pid && Process.alive?(reporter_pid), do: Process.exit(reporter_pid, :shutdown)
