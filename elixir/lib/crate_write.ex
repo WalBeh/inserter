@@ -88,8 +88,9 @@ defmodule CrateWrite do
     end
 
     # Start reporting/sampling timer (always runs to collect rate samples)
+    quiet = config.benchmark
     reporter_pid =
-      spawn_link(fn -> reporter_loop(config.threads, config.benchmark) end)
+      spawn(fn -> reporter_loop(config.threads, quiet) end)
 
     # Wait for duration or Ctrl+C
     duration_ms = config.duration * 60_000
@@ -153,7 +154,7 @@ defmodule CrateWrite do
     end
   end
 
-  defp reporter_loop(num_threads, quiet \\ false) do
+  defp reporter_loop(num_threads, quiet) do
     Process.sleep(10_000)
     stats = Monitor.get_current_stats()
 

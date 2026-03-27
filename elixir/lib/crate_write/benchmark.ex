@@ -47,7 +47,6 @@ defmodule CrateWrite.Benchmark do
     p90_total = Map.get(rate_stats, :p90, 0)
 
     rej = verification.rejected_writes
-    total = max(config.threads, 1)
 
     rej_str =
       if rej > 0 do
