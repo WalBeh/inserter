@@ -48,7 +48,7 @@ defmodule CrateWrite.Generator do
       Enum.random(@user_segments),
       Float.round(:rand.uniform() * 999.0 + 1.0, 2),
       Enum.random(1..100),
-      Jason.encode!(metadata)
+      metadata
     ]
 
     objects =
