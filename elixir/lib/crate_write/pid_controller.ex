@@ -212,9 +212,8 @@ defmodule CrateWrite.PIDController do
       if range <= 2 do
         # Converged
         IO.write(:stderr, "AUTO-TUNE: CONVERGED → #{good} senders (batch=#{state.current_batch_size})\n")
-        stats = CrateWrite.Monitor.get_current_stats()
         state = set_senders(%{state | good: good, bad: bad}, good)
-        %{state | phase: :hold, hold_throughput: stats.current_rate, adjustments: state.adjustments + 1}
+        %{state | phase: :hold, adjustments: state.adjustments + 1}
       else
         # Try midpoint
         mid = div(good + bad, 2)
@@ -226,29 +225,12 @@ defmodule CrateWrite.PIDController do
   end
 
   # --- Phase 3: HOLD ---
-  # Stay at optimal. Re-probe if throughput drops significantly.
+  # Stay at the converged optimal. Just hold steady.
+  # No re-probing — the bisection found the ceiling, trust it.
 
   defp hold(state) do
-    stats = CrateWrite.Monitor.get_current_stats()
-    current_rate = stats.current_rate
-
-    # Check if throughput dropped >30% from when we locked in
-    if state.hold_throughput > 0 and current_rate > 0 and
-       current_rate < state.hold_throughput * 0.7 do
-      IO.write(:stderr, "AUTO-TUNE: HOLD throughput dropped (#{round(current_rate)} < #{round(state.hold_throughput * 0.7)}) — re-probing\n")
-
-      # Re-enter probe from current position
-      %{state |
-        phase: :probe,
-        good: max(div(state.current_senders, 2), 2),
-        bad: nil,
-        adjustments: state.adjustments + 1
-      }
-    else
-      # Update hold throughput to track gradual changes
-      new_hold = if current_rate > 0, do: current_rate, else: state.hold_throughput
-      %{state | hold_throughput: new_hold}
-    end
+    # Nothing to do — just stay at the converged sender count
+    state
   end
 
   # --- Emergency Brake ---
