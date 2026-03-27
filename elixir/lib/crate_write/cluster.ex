@@ -81,24 +81,31 @@ defmodule CrateWrite.Cluster do
   end
 
   def get_record_count(client, table_name) do
-    Client.execute(client, "REFRESH TABLE #{table_name}")
-
-    case Client.execute_query(client, "SELECT COUNT(*) FROM #{table_name}") do
-      {:ok, [[count] | _]} -> count
+    try do
+      Client.execute(client, "REFRESH TABLE #{table_name}")
+      case Client.execute_query(client, "SELECT COUNT(*) FROM #{table_name}") do
+        {:ok, [[count] | _]} -> count
+        _ -> 0
+      end
+    rescue
       _ -> 0
+    catch
+      _, _ -> 0
     end
   end
 
   def get_rejected_writes(client) do
-    sql = """
-    SELECT SUM(pool['rejected'])
-    FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x
-    WHERE pool['name'] = 'write'
-    """
+    sql = "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
 
-    case Client.execute_query(client, sql) do
-      {:ok, [[count] | _]} -> count || 0
+    try do
+      case Client.execute_query(client, sql) do
+        {:ok, [[count] | _]} -> count || 0
+        _ -> 0
+      end
+    rescue
       _ -> 0
+    catch
+      _, _ -> 0
     end
   end
 end

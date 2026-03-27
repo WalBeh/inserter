@@ -24,7 +24,7 @@ defmodule CrateWrite.Client do
 
   def execute(%__MODULE__{} = client, sql) do
     payload = Jason.encode!(%{"stmt" => sql})
-    headers = build_headers(client.auth_header, false)
+    headers = build_headers(client.auth_header, nil)
 
     request = Finch.build(:post, client.sql_url, headers, payload)
 
