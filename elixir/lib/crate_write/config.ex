@@ -39,10 +39,14 @@ defmodule CrateWrite.Config do
       )
 
     # Load .env (check current dir and parent)
-    cond do
-      File.exists?(".env") -> Dotenvy.source(".env")
-      File.exists?("../.env") -> Dotenvy.source("../.env")
-      true -> :ok
+    env_file = cond do
+      File.exists?(".env") -> ".env"
+      File.exists?("../.env") -> "../.env"
+      true -> nil
+    end
+
+    if env_file do
+      Dotenvy.source!([env_file, System.get_env()])
     end
 
     # Start with defaults
