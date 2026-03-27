@@ -39,9 +39,9 @@ defmodule CrateWrite.PIDController do
   @ki 0.03
   @kd 0.05
 
-  @initial_senders 6
-  @initial_batch_size 500
-  @control_interval_ms 10_000
+  @initial_senders 12
+  @initial_batch_size 750
+  @control_interval_ms 5_000
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -176,7 +176,7 @@ defmodule CrateWrite.PIDController do
   end
 
   defp ramp_up(state) do
-    # Aggressive: double senders, +50% batch
+    # No latency data yet — double everything aggressively
     new_senders = min(state.current_senders * 2, state.max_senders)
     new_batch = min(round(state.current_batch_size * 1.5), state.max_batch_size)
 
@@ -194,19 +194,32 @@ defmodule CrateWrite.PIDController do
   end
 
   defp ramp_up_pid(state, current_p95) do
-    # PID-controlled ramp up
+    # If we've never backed off, keep doubling (fast discovery)
+    # Once we've backed off, switch to additive (fine-tuning)
+    {new_senders, new_batch} =
+      if state.phase == :ramp_up and state.emergency_brakes == 0 do
+        # Multiplicative: double senders, +50% batch
+        s = min(state.current_senders * 2, state.max_senders)
+        b = min(round(state.current_batch_size * 1.5), state.max_batch_size)
+        {s, b}
+      else
+        # Additive: PID-controlled fine-tuning
+        error = state.latency_target_ms - current_p95
+        derivative = error - state.last_error
+        integral = clamp(state.integral + error, -10_000, 10_000)
+
+        output = @kp * error + @ki * integral + @kd * derivative
+
+        sender_add = max(round(output / 300), 1)
+        batch_add = max(round(output / 5), 50)
+
+        s = min(state.current_senders + sender_add, state.max_senders)
+        b = min(state.current_batch_size + batch_add, state.max_batch_size)
+        {s, b}
+      end
+
     error = state.latency_target_ms - current_p95
-    derivative = error - state.last_error
     integral = clamp(state.integral + error, -10_000, 10_000)
-
-    output = @kp * error + @ki * integral + @kd * derivative
-
-    # Add senders proportional to headroom
-    sender_add = max(round(output / 300), 1)
-    batch_add = max(round(output / 5), 50)
-
-    new_senders = min(state.current_senders + sender_add, state.max_senders)
-    new_batch = min(state.current_batch_size + batch_add, state.max_batch_size)
 
     if new_senders != state.current_senders or new_batch != state.current_batch_size do
       IO.write(:stderr, "AUTO-TUNE: UP p95=#{round(current_p95)}ms senders=#{state.current_senders}→#{new_senders} batch=#{state.current_batch_size}→#{new_batch}\n")
