@@ -1,12 +1,10 @@
 defmodule CrateWrite.PIDController do
   @moduledoc """
-  PID controller that auto-tunes sender count and batch size.
+  Binary search controller that finds the optimal sender count.
 
-  Strategy:
-  - Ramp up aggressively (multiplicative increase) to find ceiling fast
-  - Back off gently (25% reduction) on overload
-  - Dead zone: don't adjust if latency is 70-100% of target
-  - Emergency brake on rejected writes: reduce 25%, reset integral
+  Phase 1: PROBE — ramp up aggressively until P95 latency exceeds target
+  Phase 2: BISECT — binary search between last-good and first-bad
+  Phase 3: HOLD — lock at optimal, re-probe if throughput drops
   """
   use GenServer
   require Logger
@@ -18,27 +16,24 @@ defmodule CrateWrite.PIDController do
     :max_batch_size,
     :latency_target_ms,
     :batch_interval,
-    # PID state
-    :last_error,
-    :integral,
-    :cooldown,  # cycles to skip after back-off
-    # Current tuning
+    # State
     :current_senders,
     :current_batch_size,
     :sender_pids,
+    :phase,  # :probe | :bisect | :hold
+    # Bisection bounds
+    :good,   # highest sender count with P95 < target
+    :bad,    # lowest sender count with P95 > target
+    # Hold phase
+    :hold_throughput,  # throughput when we locked in
     # Tracking
     :last_rejected,
     :adjustments,
     :emergency_brakes,
     :sender_history,
     :batch_history,
-    :peak_senders,
-    :phase  # :ramp_up | :stable | :recovery
+    :peak_senders
   ]
-
-  @kp 0.15
-  @ki 0.03
-  @kd 0.05
 
   @initial_senders 12
   @initial_batch_size 750
@@ -65,28 +60,25 @@ defmodule CrateWrite.PIDController do
       max_batch_size: opts[:max_batch_size],
       latency_target_ms: opts[:latency_target_ms],
       batch_interval: opts[:batch_interval],
-      last_error: 0.0,
-      integral: 0.0,
-      cooldown: 0,
       current_senders: @initial_senders,
       current_batch_size: @initial_batch_size,
       sender_pids: [],
+      phase: :probe,
+      good: @initial_senders,
+      bad: nil,
+      hold_throughput: 0,
       last_rejected: last_rejected,
       adjustments: 0,
       emergency_brakes: 0,
       sender_history: [@initial_senders],
       batch_history: [@initial_batch_size],
-      peak_senders: @initial_senders,
-      phase: :ramp_up
+      peak_senders: @initial_senders
     }
 
-    # Initialize dynamic batch size
     CrateWrite.GeneratorWorker.set_batch_size(@initial_batch_size)
-
-    # Spawn initial senders
     state = spawn_n_senders(state, @initial_senders)
 
-    IO.write(:stderr, "AUTO-TUNE: start senders=#{@initial_senders} batch=#{@initial_batch_size} target=#{state.latency_target_ms}ms\n")
+    IO.write(:stderr, "AUTO-TUNE: PROBE start senders=#{@initial_senders} batch=#{@initial_batch_size} target=#{state.latency_target_ms}ms\n")
 
     Process.send_after(self(), :control_tick, @control_interval_ms)
     {:ok, state}
@@ -103,11 +95,13 @@ defmodule CrateWrite.PIDController do
   def handle_call(:get_state, _from, state) do
     result = %{
       enabled: true,
+      algorithm: "bisect",
       latency_target_ms: state.latency_target_ms,
       initial_senders: @initial_senders,
       initial_batch_size: @initial_batch_size,
       final_senders: state.current_senders,
       final_batch_size: state.current_batch_size,
+      final_phase: Atom.to_string(state.phase),
       peak_senders: state.peak_senders,
       adjustments: state.adjustments,
       emergency_brakes: state.emergency_brakes,
@@ -120,17 +114,7 @@ defmodule CrateWrite.PIDController do
   # --- Control Logic ---
 
   defp run_control_cycle(state) do
-    # Cooldown: after back-off, wait before adjusting again (let CrateDB drain queue)
-    if state.cooldown > 0 do
-      IO.write(:stderr, "AUTO-TUNE: WAIT cooldown=#{state.cooldown} senders=#{state.current_senders} batch=#{state.current_batch_size}\n")
-      %{state | cooldown: state.cooldown - 1}
-    else
-      do_control_cycle(state)
-    end
-  end
-
-  defp do_control_cycle(state) do
-    # Check rejected writes
+    # Check rejected writes first (always)
     current_rejected = CrateWrite.Cluster.get_rejected_writes(state.client)
     new_rejections = current_rejected - state.last_rejected
     state = %{state | last_rejected: current_rejected}
@@ -138,33 +122,147 @@ defmodule CrateWrite.PIDController do
     if new_rejections > 0 do
       emergency_brake(state, new_rejections)
     else
-      latency_stats = CrateWrite.Monitor.get_window_latency_stats()
-      current_p95 = latency_stats.p95
-
-      if current_p95 == 0 do
-        ramp_up(state)
-      else
-        ratio = current_p95 / state.latency_target_ms
-
-        cond do
-          ratio > 1.0 ->
-            back_off(state, current_p95, ratio)
-
-          ratio < 0.7 ->
-            ramp_up_pid(state, current_p95)
-
-          true ->
-            if state.phase != :stable do
-              IO.write(:stderr, "AUTO-TUNE: STABLE p95=#{round(current_p95)}ms senders=#{state.current_senders} batch=#{state.current_batch_size}\n")
-            end
-            %{state | phase: :stable, last_error: state.latency_target_ms - current_p95}
-        end
+      case state.phase do
+        :probe -> probe(state)
+        :bisect -> bisect(state)
+        :hold -> hold(state)
       end
     end
   end
 
+  # --- Phase 1: PROBE ---
+  # Ramp up aggressively until P95 exceeds target. This finds the cliff.
+
+  defp probe(state) do
+    latency = CrateWrite.Monitor.get_window_latency_stats()
+    p95 = latency.p95
+
+    if p95 == 0 do
+      # No data yet — keep ramping
+      ramp_up(state)
+    else
+      if p95 > state.latency_target_ms do
+        # Found the cliff! Current count is bad, previous was good
+        bad = state.current_senders
+        good = state.good
+
+        IO.write(:stderr, "AUTO-TUNE: CLIFF at #{bad} senders (p95=#{round(p95)}ms) — bisecting [#{good}, #{bad}]\n")
+
+        # Lock batch size for bisection
+        %{state |
+          phase: :bisect,
+          bad: bad,
+          good: good,
+          adjustments: state.adjustments + 1
+        }
+        |> bisect_step()
+      else
+        # Under target — this count is good, keep probing
+        state = %{state | good: state.current_senders}
+        ramp_up(state)
+      end
+    end
+  end
+
+  defp ramp_up(state) do
+    # Double until 24, then +50%
+    multiplier = if state.current_senders < 24, do: 2.0, else: 1.5
+    new_senders = min(round(state.current_senders * multiplier), state.max_senders)
+
+    # Also ramp batch during probe
+    new_batch = min(round(state.current_batch_size * 1.3), state.max_batch_size)
+
+    IO.write(:stderr, "AUTO-TUNE: PROBE senders=#{state.current_senders}→#{new_senders} batch=#{state.current_batch_size}→#{new_batch} (p95 ok)\n")
+
+    state = set_senders(state, new_senders)
+    CrateWrite.GeneratorWorker.set_batch_size(new_batch)
+
+    %{state |
+      current_batch_size: new_batch,
+      adjustments: state.adjustments + 1,
+      batch_history: [new_batch | state.batch_history]
+    }
+  end
+
+  # --- Phase 2: BISECT ---
+  # Binary search between good (under target) and bad (over target).
+
+  defp bisect(state) do
+    latency = CrateWrite.Monitor.get_window_latency_stats()
+    p95 = latency.p95
+
+    if p95 == 0 do
+      # No data yet for this sender count — wait
+      state
+    else
+      if p95 > state.latency_target_ms do
+        # This count is too high
+        state = %{state | bad: state.current_senders}
+        IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} TOO HIGH (p95=#{round(p95)}ms) range=[#{state.good}, #{state.bad}]\n")
+      else
+        # This count is fine
+        state = %{state | good: state.current_senders}
+        IO.write(:stderr, "AUTO-TUNE: BISECT #{state.current_senders} OK (p95=#{round(p95)}ms) range=[#{state.good}, #{state.bad}]\n")
+      end
+
+      bisect_step(state)
+    end
+  end
+
+  defp bisect_step(state) do
+    range = state.bad - state.good
+
+    if range <= 2 do
+      # Converged — use the good value
+      IO.write(:stderr, "AUTO-TUNE: CONVERGED → #{state.good} senders (batch=#{state.current_batch_size})\n")
+
+      stats = CrateWrite.Monitor.get_current_stats()
+
+      state = set_senders(state, state.good)
+      %{state |
+        phase: :hold,
+        hold_throughput: stats.current_rate,
+        adjustments: state.adjustments + 1
+      }
+    else
+      # Try the midpoint
+      mid = div(state.good + state.bad, 2)
+      IO.write(:stderr, "AUTO-TUNE: BISECT trying #{mid} senders (range=[#{state.good}, #{state.bad}])\n")
+
+      state = set_senders(state, mid)
+      %{state | adjustments: state.adjustments + 1}
+    end
+  end
+
+  # --- Phase 3: HOLD ---
+  # Stay at optimal. Re-probe if throughput drops significantly.
+
+  defp hold(state) do
+    stats = CrateWrite.Monitor.get_current_stats()
+    current_rate = stats.current_rate
+
+    # Check if throughput dropped >30% from when we locked in
+    if state.hold_throughput > 0 and current_rate > 0 and
+       current_rate < state.hold_throughput * 0.7 do
+      IO.write(:stderr, "AUTO-TUNE: HOLD throughput dropped (#{round(current_rate)} < #{round(state.hold_throughput * 0.7)}) — re-probing\n")
+
+      # Re-enter probe from current position
+      %{state |
+        phase: :probe,
+        good: max(div(state.current_senders, 2), 2),
+        bad: nil,
+        adjustments: state.adjustments + 1
+      }
+    else
+      # Update hold throughput to track gradual changes
+      new_hold = if current_rate > 0, do: current_rate, else: state.hold_throughput
+      %{state | hold_throughput: new_hold}
+    end
+  end
+
+  # --- Emergency Brake ---
+
   defp emergency_brake(state, new_rejections) do
-    # Reduce by 25% (not 50% — avoid traffic jam)
     new_senders = max(round(state.current_senders * 0.75), 2)
     new_batch = max(round(state.current_batch_size * 0.75), 100)
 
@@ -173,97 +271,15 @@ defmodule CrateWrite.PIDController do
     state = set_senders(state, new_senders)
     CrateWrite.GeneratorWorker.set_batch_size(new_batch)
 
+    # Re-enter bisection with current as bad, reduced as potential good
     %{state |
       current_batch_size: new_batch,
+      phase: :bisect,
+      bad: state.current_senders,
+      good: new_senders,
       emergency_brakes: state.emergency_brakes + 1,
       adjustments: state.adjustments + 1,
-      integral: 0.0,
-      cooldown: 4,  # Wait 4 cycles (20s) for CrateDB to drain queue
-      phase: :recovery,
       batch_history: [new_batch | state.batch_history]
-    }
-  end
-
-  defp ramp_up(state) do
-    # No latency data yet — double everything aggressively
-    new_senders = min(state.current_senders * 2, state.max_senders)
-    new_batch = min(round(state.current_batch_size * 1.5), state.max_batch_size)
-
-    IO.write(:stderr, "AUTO-TUNE: RAMP senders=#{state.current_senders}→#{new_senders} batch=#{state.current_batch_size}→#{new_batch}\n")
-
-    state = set_senders(state, new_senders)
-    CrateWrite.GeneratorWorker.set_batch_size(new_batch)
-
-    %{state |
-      current_batch_size: new_batch,
-      adjustments: state.adjustments + 1,
-      phase: :ramp_up,
-      batch_history: [new_batch | state.batch_history]
-    }
-  end
-
-  defp ramp_up_pid(state, current_p95) do
-    # If we've never backed off, keep doubling (fast discovery)
-    # Once we've backed off, switch to additive (fine-tuning)
-    {new_senders, new_batch} =
-      if state.phase == :ramp_up and state.emergency_brakes == 0 do
-        # Multiplicative: double until 24, then +50% to avoid overshoot
-        multiplier = if state.current_senders < 24, do: 2.0, else: 1.5
-        s = min(round(state.current_senders * multiplier), state.max_senders)
-        b = min(round(state.current_batch_size * 1.3), state.max_batch_size)
-        {s, b}
-      else
-        # Additive: PID-controlled fine-tuning
-        error = state.latency_target_ms - current_p95
-        derivative = error - state.last_error
-        integral = clamp(state.integral + error, -10_000, 10_000)
-
-        output = @kp * error + @ki * integral + @kd * derivative
-
-        sender_add = max(round(output / 300), 1)
-        batch_add = max(round(output / 5), 50)
-
-        s = min(state.current_senders + sender_add, state.max_senders)
-        b = min(state.current_batch_size + batch_add, state.max_batch_size)
-        {s, b}
-      end
-
-    error = state.latency_target_ms - current_p95
-    integral = clamp(state.integral + error, -10_000, 10_000)
-
-    if new_senders != state.current_senders or new_batch != state.current_batch_size do
-      IO.write(:stderr, "AUTO-TUNE: UP p95=#{round(current_p95)}ms senders=#{state.current_senders}→#{new_senders} batch=#{state.current_batch_size}→#{new_batch}\n")
-
-      state = set_senders(state, new_senders)
-      CrateWrite.GeneratorWorker.set_batch_size(new_batch)
-
-      %{state |
-        current_batch_size: new_batch,
-        last_error: error,
-        integral: integral,
-        adjustments: state.adjustments + 1,
-        phase: :ramp_up,
-        batch_history: [new_batch | state.batch_history]
-      }
-    else
-      %{state | last_error: error, integral: integral}
-    end
-  end
-
-  defp back_off(state, current_p95, ratio) do
-    # Gentle: reduce by 10-15%, minimum 1 sender removed
-    reduction = max(round(state.current_senders * min(ratio - 1.0, 0.5) * 0.15), 1)
-    new_senders = max(state.current_senders - reduction, 2)
-
-    IO.write(:stderr, "AUTO-TUNE: DOWN p95=#{round(current_p95)}ms senders=#{state.current_senders}→#{new_senders}\n")
-
-    state = set_senders(state, new_senders)
-
-    %{state |
-      adjustments: state.adjustments + 1,
-      integral: 0.0,
-      cooldown: 3,  # Wait 3 cycles (15s) before next adjustment
-      phase: :recovery
     }
   end
 
@@ -285,8 +301,8 @@ defmodule CrateWrite.PIDController do
   end
 
   defp set_senders(state, target) do
-    current = length(Enum.filter(state.sender_pids, &Process.alive?/1))
     alive_pids = Enum.filter(state.sender_pids, &Process.alive?/1)
+    current = length(alive_pids)
 
     state =
       cond do
@@ -309,6 +325,4 @@ defmodule CrateWrite.PIDController do
       sender_history: [target | state.sender_history]
     }
   end
-
-  defp clamp(val, min_val, max_val), do: max(min(val, max_val), min_val)
 end
