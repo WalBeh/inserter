@@ -21,6 +21,7 @@ defmodule CrateWrite.PIDController do
     # PID state
     :last_error,
     :integral,
+    :cooldown,  # cycles to skip after back-off
     # Current tuning
     :current_senders,
     :current_batch_size,
@@ -66,6 +67,7 @@ defmodule CrateWrite.PIDController do
       batch_interval: opts[:batch_interval],
       last_error: 0.0,
       integral: 0.0,
+      cooldown: 0,
       current_senders: @initial_senders,
       current_batch_size: @initial_batch_size,
       sender_pids: [],
@@ -118,6 +120,16 @@ defmodule CrateWrite.PIDController do
   # --- Control Logic ---
 
   defp run_control_cycle(state) do
+    # Cooldown: after back-off, wait before adjusting again (let CrateDB drain queue)
+    if state.cooldown > 0 do
+      IO.write(:stderr, "AUTO-TUNE: WAIT cooldown=#{state.cooldown} senders=#{state.current_senders} batch=#{state.current_batch_size}\n")
+      %{state | cooldown: state.cooldown - 1}
+    else
+      do_control_cycle(state)
+    end
+  end
+
+  defp do_control_cycle(state) do
     # Check rejected writes
     current_rejected = CrateWrite.Cluster.get_rejected_writes(state.client)
     new_rejections = current_rejected - state.last_rejected
@@ -130,22 +142,18 @@ defmodule CrateWrite.PIDController do
       current_p95 = latency_stats.p95
 
       if current_p95 == 0 do
-        # No data yet — ramp up
         ramp_up(state)
       else
         ratio = current_p95 / state.latency_target_ms
 
         cond do
           ratio > 1.0 ->
-            # Over target — back off gently
             back_off(state, current_p95, ratio)
 
           ratio < 0.7 ->
-            # Under 70% of target — ramp up
             ramp_up_pid(state, current_p95)
 
           true ->
-            # Dead zone (70-100% of target) — stable, don't adjust
             if state.phase != :stable do
               IO.write(:stderr, "AUTO-TUNE: STABLE p95=#{round(current_p95)}ms senders=#{state.current_senders} batch=#{state.current_batch_size}\n")
             end
@@ -170,6 +178,7 @@ defmodule CrateWrite.PIDController do
       emergency_brakes: state.emergency_brakes + 1,
       adjustments: state.adjustments + 1,
       integral: 0.0,
+      cooldown: 4,  # Wait 4 cycles (20s) for CrateDB to drain queue
       phase: :recovery,
       batch_history: [new_batch | state.batch_history]
     }
@@ -198,9 +207,10 @@ defmodule CrateWrite.PIDController do
     # Once we've backed off, switch to additive (fine-tuning)
     {new_senders, new_batch} =
       if state.phase == :ramp_up and state.emergency_brakes == 0 do
-        # Multiplicative: double senders, +50% batch
-        s = min(state.current_senders * 2, state.max_senders)
-        b = min(round(state.current_batch_size * 1.5), state.max_batch_size)
+        # Multiplicative: double until 24, then +50% to avoid overshoot
+        multiplier = if state.current_senders < 24, do: 2.0, else: 1.5
+        s = min(round(state.current_senders * multiplier), state.max_senders)
+        b = min(round(state.current_batch_size * 1.3), state.max_batch_size)
         {s, b}
       else
         # Additive: PID-controlled fine-tuning
@@ -241,20 +251,18 @@ defmodule CrateWrite.PIDController do
   end
 
   defp back_off(state, current_p95, ratio) do
-    # Gentle: reduce by (ratio - 1) * 15%, minimum 1 sender removed
-    reduction = max(round(state.current_senders * (ratio - 1.0) * 0.15), 1)
+    # Gentle: reduce by 10-15%, minimum 1 sender removed
+    reduction = max(round(state.current_senders * min(ratio - 1.0, 0.5) * 0.15), 1)
     new_senders = max(state.current_senders - reduction, 2)
-    # Don't reduce batch on gentle back-off — only on emergency
-    new_batch = state.current_batch_size
 
     IO.write(:stderr, "AUTO-TUNE: DOWN p95=#{round(current_p95)}ms senders=#{state.current_senders}→#{new_senders}\n")
 
     state = set_senders(state, new_senders)
 
     %{state |
-      current_batch_size: new_batch,
       adjustments: state.adjustments + 1,
-      integral: 0.0,  # Reset to avoid overshoot on recovery
+      integral: 0.0,
+      cooldown: 3,  # Wait 3 cycles (15s) before next adjustment
       phase: :recovery
     }
   end
