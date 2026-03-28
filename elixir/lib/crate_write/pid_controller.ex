@@ -193,6 +193,14 @@ defmodule CrateWrite.PIDController do
     %{state | adjustments: state.adjustments + 1}
   end
 
+  defp stats_label do
+    latency = CrateWrite.Monitor.get_window_latency_stats()
+    stats = CrateWrite.Monitor.get_current_stats()
+    rate = round(stats.current_rate)
+    p95 = round(latency.p95)
+    "p95=#{p95}ms rate=#{rate}rec/s"
+  end
+
   defp ramp_up(state) do
     multiplier = if state.current_senders < 24, do: 2.0, else: 1.5
     new_senders = min(round(state.current_senders * multiplier), state.max_senders)
@@ -209,14 +217,14 @@ defmodule CrateWrite.PIDController do
     if new_senders == state.current_senders do
       if state.mode == "rejections" do
         # Senders maxed — now probe batch size
-        IO.write(:stderr, "AUTO-TUNE: MAX SENDERS=#{new_senders} — now probing batch size\n")
+        IO.write(:stderr, "AUTO-TUNE: MAX SENDERS=#{new_senders} [#{stats_label()}] — now probing batch size\n")
         %{state | phase: :probe_batch, good_batch: state.current_batch_size}
       else
-        IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} — no rejections at max capacity, holding\n")
+        IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} [#{stats_label()}] — no rejections, holding\n")
         %{state | phase: :hold}
       end
     else
-      IO.write(:stderr, "AUTO-TUNE: PROBE senders=#{state.current_senders}→#{new_senders} batch=#{new_batch}\n")
+      IO.write(:stderr, "AUTO-TUNE: PROBE senders=#{state.current_senders}→#{new_senders} batch=#{new_batch} [#{stats_label()}]\n")
 
       state = set_senders(state, new_senders)
 
@@ -244,7 +252,7 @@ defmodule CrateWrite.PIDController do
 
       range = state.bad - good
       if range <= 2 do
-        IO.write(:stderr, "AUTO-TUNE: CONVERGED → #{good} senders (batch=#{state.current_batch_size})\n")
+        IO.write(:stderr, "AUTO-TUNE: CONVERGED → #{good} senders batch=#{state.current_batch_size} [#{stats_label()}]\n")
         state = set_senders(%{state | good: good}, good)
         %{state | phase: :hold, adjustments: state.adjustments + 1}
       else
@@ -284,7 +292,7 @@ defmodule CrateWrite.PIDController do
 
       if range <= 2 do
         # Converged
-        IO.write(:stderr, "AUTO-TUNE: CONVERGED → #{good} senders (batch=#{state.current_batch_size})\n")
+        IO.write(:stderr, "AUTO-TUNE: CONVERGED → #{good} senders batch=#{state.current_batch_size} [#{stats_label()}]\n")
         state = set_senders(%{state | good: good, bad: bad}, good)
         %{state | phase: :hold, adjustments: state.adjustments + 1}
       else
@@ -304,10 +312,10 @@ defmodule CrateWrite.PIDController do
     new_batch = round(state.current_batch_size * 1.3)
 
     if new_batch > state.max_batch_size do
-      IO.write(:stderr, "AUTO-TUNE: MAX BATCH=#{state.current_batch_size} — no rejections, holding\n")
+      IO.write(:stderr, "AUTO-TUNE: MAX BATCH=#{state.current_batch_size} [#{stats_label()}] — no rejections, holding\n")
       %{state | phase: :hold}
     else
-      IO.write(:stderr, "AUTO-TUNE: PROBE BATCH #{state.current_batch_size}→#{new_batch} senders=#{state.current_senders}\n")
+      IO.write(:stderr, "AUTO-TUNE: PROBE BATCH #{state.current_batch_size}→#{new_batch} senders=#{state.current_senders} [#{stats_label()}]\n")
 
       CrateWrite.GeneratorWorker.set_batch_size(new_batch)
 
@@ -332,7 +340,7 @@ defmodule CrateWrite.PIDController do
     range = bad - good
 
     if range <= 100 do
-      IO.write(:stderr, "AUTO-TUNE: CONVERGED → senders=#{state.current_senders} batch=#{good}\n")
+      IO.write(:stderr, "AUTO-TUNE: CONVERGED → senders=#{state.current_senders} batch=#{good} [#{stats_label()}]\n")
       CrateWrite.GeneratorWorker.set_batch_size(good)
       %{state | current_batch_size: good, good_batch: good, phase: :hold, adjustments: state.adjustments + 1}
     else
