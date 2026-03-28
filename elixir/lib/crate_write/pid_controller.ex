@@ -245,9 +245,7 @@ defmodule CrateWrite.PIDController do
   end
 
   defp get_stats do
-    latency = CrateWrite.Monitor.get_window_latency_stats()
-    stats = CrateWrite.Monitor.get_current_stats()
-    %{rate: stats.current_rate, p95: latency.p95}
+    CrateWrite.Monitor.get_snapshot()
   end
 
   defp format_stats(%{rate: rate, p95: p95}) do

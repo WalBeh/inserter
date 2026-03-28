@@ -29,8 +29,11 @@ defmodule CrateWrite.Monitor do
   def get_final_stats, do: GenServer.call(__MODULE__, :get_final_stats)
   def get_percentile_stats, do: GenServer.call(__MODULE__, :get_percentile_stats)
   def get_latency_stats, do: GenServer.call(__MODULE__, :get_latency_stats)
-  @doc "Latency stats from the last window only (for PID controller)."
+  @doc "Latency stats from the last window only (for PID controller). Resets window."
   def get_window_latency_stats, do: GenServer.call(__MODULE__, :get_window_latency_stats)
+
+  @doc "Snapshot of current rate and window latency in one atomic call. Resets both windows."
+  def get_snapshot, do: GenServer.call(__MODULE__, :get_snapshot)
 
   def get_bandwidth_mbps do
     bytes = :ets.lookup_element(@table, :total_bytes_sent, 2)
@@ -156,6 +159,29 @@ defmodule CrateWrite.Monitor do
     stats = compute_percentiles(state.window_latency_samples)
     # Reset window after reading — next call gets only fresh samples
     {:reply, stats, %{state | window_latency_samples: []}}
+  end
+
+  def handle_call(:get_snapshot, _from, state) do
+    now = System.monotonic_time(:millisecond)
+    total_records = :ets.lookup_element(@table, :total_records, 2)
+
+    period_ms = now - state.last_report_time
+    records_since_last = total_records - state.last_report_records
+
+    current_rate =
+      if period_ms > 1000, do: records_since_last / (period_ms / 1000.0), else: 0.0
+
+    latency = compute_percentiles(state.window_latency_samples)
+
+    # Reset windows
+    new_state = %{state |
+      last_report_time: now,
+      last_report_records: total_records,
+      rate_samples: [current_rate | state.rate_samples],
+      window_latency_samples: []
+    }
+
+    {:reply, %{rate: current_rate, p95: latency.p95}, new_state}
   end
 
   def handle_call({:get_bandwidth_mbps, bytes}, _from, state) do
