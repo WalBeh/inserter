@@ -187,7 +187,7 @@ defmodule CrateWrite.PIDController do
               good: state.current_senders
             }
 
-          rate > 0 and state.peak_rate > 0 and rate < state.peak_rate * 0.9 ->
+          rate > 0 and state.peak_rate > 0 and rate < state.peak_rate * 0.8 ->
             # Below 90% of peak
             %{state | below_peak_count: state.below_peak_count + 1}
 
@@ -196,7 +196,7 @@ defmodule CrateWrite.PIDController do
             %{state | below_peak_count: 0, good: state.current_senders}
         end
 
-      if state.below_peak_count >= 2 do
+      if state.below_peak_count >= 3 do
         # Throughput has degraded — revert to peak config
         IO.write(:stderr, "AUTO-TUNE: PEAK FOUND rate=#{round(state.peak_rate)}rec/s at senders=#{state.peak_rate_senders} batch=#{state.peak_rate_batch} — reverting [#{format_stats(current_stats)}]\n")
 
@@ -375,14 +375,14 @@ defmodule CrateWrite.PIDController do
           good_batch: state.current_batch_size
         }
       else
-        if rate > 0 and state.peak_rate > 0 and rate < state.peak_rate * 0.9 do
+        if rate > 0 and state.peak_rate > 0 and rate < state.peak_rate * 0.8 do
           %{state | below_peak_count: state.below_peak_count + 1}
         else
           %{state | below_peak_count: 0, good_batch: state.current_batch_size}
         end
       end
 
-    if state.below_peak_count >= 2 do
+    if state.below_peak_count >= 3 do
       # Throughput degraded — revert to peak batch
       IO.write(:stderr, "AUTO-TUNE: PEAK BATCH rate=#{round(state.peak_rate)}rec/s at batch=#{state.peak_rate_batch} — reverting [#{format_stats(get_stats())}]\n")
 
