@@ -31,7 +31,9 @@ defmodule CrateWrite.PIDController do
     :peak_rate,           # highest throughput seen
     :peak_rate_senders,   # sender count at peak
     :peak_rate_batch,     # batch size at peak
+    :peak_rate_p95,       # latency at peak
     :below_peak_count,    # consecutive cycles below peak
+    :latency_worse_count, # consecutive cycles with 3x+ latency without rate gain
     # Tracking
     :last_rejected,
     :adjustments,
@@ -90,7 +92,9 @@ defmodule CrateWrite.PIDController do
       peak_rate: 0,
       peak_rate_senders: @initial_senders,
       peak_rate_batch: initial_batch,
+      peak_rate_p95: 0,
       below_peak_count: 0,
+      latency_worse_count: 0,
       bad_batch: nil,
       last_rejected: last_rejected,
       adjustments: 0,
@@ -131,6 +135,7 @@ defmodule CrateWrite.PIDController do
       final_phase: Atom.to_string(state.phase),
       peak_senders: state.peak_senders,
       peak_rate: round(state.peak_rate),
+      peak_rate_p95: round(state.peak_rate_p95),
       peak_rate_senders: state.peak_rate_senders,
       peak_rate_batch: state.peak_rate_batch,
       adjustments: state.adjustments,
@@ -183,12 +188,14 @@ defmodule CrateWrite.PIDController do
               peak_rate: rate,
               peak_rate_senders: state.current_senders,
               peak_rate_batch: state.current_batch_size,
+              peak_rate_p95: current_stats.p95,
               below_peak_count: 0,
+              latency_worse_count: 0,
               good: state.current_senders
             }
 
           rate > 0 and state.peak_rate > 0 and rate < state.peak_rate * 0.8 ->
-            # Below 90% of peak
+            # Below 80% of peak
             %{state | below_peak_count: state.below_peak_count + 1}
 
           true ->
@@ -196,9 +203,20 @@ defmodule CrateWrite.PIDController do
             %{state | below_peak_count: 0, good: state.current_senders}
         end
 
-      if state.below_peak_count >= 3 do
-        # Throughput has degraded — revert to peak config
-        IO.write(:stderr, "AUTO-TUNE: PEAK FOUND rate=#{round(state.peak_rate)}rec/s at senders=#{state.peak_rate_senders} batch=#{state.peak_rate_batch} — reverting [#{format_stats(current_stats)}]\n")
+      # Latency guardrail for sender probing too
+      p95 = current_stats.p95
+      state =
+        if state.peak_rate_p95 > 0 and p95 > state.peak_rate_p95 * 3 and rate <= state.peak_rate do
+          %{state | latency_worse_count: state.latency_worse_count + 1}
+        else
+          if rate > state.peak_rate, do: %{state | latency_worse_count: 0}, else: state
+        end
+
+      should_revert = state.below_peak_count >= 3 or state.latency_worse_count >= 3
+
+      if should_revert do
+        reason = if state.latency_worse_count >= 3, do: "latency 3x+ worse", else: "rate dropped"
+        IO.write(:stderr, "AUTO-TUNE: PEAK FOUND rate=#{round(state.peak_rate)}rec/s p95=#{round(state.peak_rate_p95)}ms at senders=#{state.peak_rate_senders} — reverting (#{reason}) [#{format_stats(current_stats)}]\n")
 
         state = set_senders(state, state.peak_rate_senders)
         CrateWrite.GeneratorWorker.set_batch_size(state.peak_rate_batch)
@@ -361,17 +379,20 @@ defmodule CrateWrite.PIDController do
   # Senders are maxed. Now grow batch size until rejections appear.
 
   defp probe_batch(state) do
-    # Track peak throughput during batch probing
     current_stats = get_stats()
     rate = current_stats.rate
+    p95 = current_stats.p95
 
+    # Track peak throughput
     state =
       if rate > state.peak_rate and rate > 0 do
         %{state |
           peak_rate: rate,
           peak_rate_senders: state.current_senders,
           peak_rate_batch: state.current_batch_size,
+          peak_rate_p95: p95,
           below_peak_count: 0,
+          latency_worse_count: 0,
           good_batch: state.current_batch_size
         }
       else
@@ -382,9 +403,19 @@ defmodule CrateWrite.PIDController do
         end
       end
 
-    if state.below_peak_count >= 3 do
-      # Throughput degraded — revert to peak batch
-      IO.write(:stderr, "AUTO-TUNE: PEAK BATCH rate=#{round(state.peak_rate)}rec/s at batch=#{state.peak_rate_batch} — reverting [#{format_stats(current_stats)}]\n")
+    # Latency guardrail: if p95 is 3x+ worse than at peak without rate improving, count it
+    state =
+      if state.peak_rate_p95 > 0 and p95 > state.peak_rate_p95 * 3 and rate <= state.peak_rate do
+        %{state | latency_worse_count: state.latency_worse_count + 1}
+      else
+        if rate > state.peak_rate, do: %{state | latency_worse_count: 0}, else: state
+      end
+
+    should_revert = state.below_peak_count >= 3 or state.latency_worse_count >= 3
+
+    if should_revert do
+      reason = if state.latency_worse_count >= 3, do: "latency 3x+ worse", else: "rate dropped"
+      IO.write(:stderr, "AUTO-TUNE: PEAK BATCH rate=#{round(state.peak_rate)}rec/s p95=#{round(state.peak_rate_p95)}ms at batch=#{state.peak_rate_batch} — reverting (#{reason}) [#{format_stats(current_stats)}]\n")
 
       CrateWrite.GeneratorWorker.set_batch_size(state.peak_rate_batch)
 
