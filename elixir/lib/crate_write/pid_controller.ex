@@ -180,15 +180,19 @@ defmodule CrateWrite.PIDController do
       current_stats = get_stats()
       rate = current_stats.rate
 
+      p95 = current_stats.p95
+      latency_ok = state.peak_rate_p95 == 0 or p95 <= state.peak_rate_p95 * 3
+      rate_significantly_better = rate > state.peak_rate * 1.1
+
       state =
         cond do
-          rate > state.peak_rate and rate > 0 ->
-            # New peak — record it
+          rate > state.peak_rate and rate > 0 and (latency_ok or rate_significantly_better) ->
+            # New peak — only if latency isn't 3x+ worse (unless rate is >10% better)
             %{state |
               peak_rate: rate,
               peak_rate_senders: state.current_senders,
               peak_rate_batch: state.current_batch_size,
-              peak_rate_p95: current_stats.p95,
+              peak_rate_p95: p95,
               below_peak_count: 0,
               latency_worse_count: 0,
               good: state.current_senders
@@ -383,9 +387,13 @@ defmodule CrateWrite.PIDController do
     rate = current_stats.rate
     p95 = current_stats.p95
 
-    # Track peak throughput
+    # Track peak throughput — only update if latency isn't dramatically worse
+    # A 4% rate gain at 7x latency is not a real improvement
+    latency_ok = state.peak_rate_p95 == 0 or p95 <= state.peak_rate_p95 * 3
+    rate_significantly_better = rate > state.peak_rate * 1.1  # >10% improvement overrides latency check
+
     state =
-      if rate > state.peak_rate and rate > 0 do
+      if rate > state.peak_rate and rate > 0 and (latency_ok or rate_significantly_better) do
         %{state |
           peak_rate: rate,
           peak_rate_senders: state.current_senders,
