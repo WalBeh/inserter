@@ -671,6 +671,14 @@ async def run_async_engine(
                 error_rate = (final_stats["errors"] / max(final_stats["total_batches"], 1)) * 100
                 logger.warning(f"Error rate: {error_rate:.2f}%")
 
+        # Clean up: drop the benchmark table
+        try:
+            await client.execute(f"DROP TABLE IF EXISTS {table_name}")
+            if not benchmark:
+                logger.info(f"Cleaned up table '{table_name}'")
+        except Exception:
+            pass
+
 
 def make_fresh_request(connection_string: str) -> Tuple[Dict, str, int, Dict]:
     """

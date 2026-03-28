@@ -433,6 +433,13 @@ async fn run_data_generation(
         info!("{}", "=".repeat(60));
     }
 
+    // Clean up: drop the benchmark table
+    let drop_sql = format!("DROP TABLE IF EXISTS {}", table_name);
+    match client.execute(&drop_sql, &[]).await {
+        Ok(_) => info!("Cleaned up table '{}'", table_name),
+        Err(e) => warn!("Failed to drop table: {}", e),
+    }
+
     Ok(())
 }
 
