@@ -182,14 +182,8 @@ defmodule CrateWrite.PIDController do
     multiplier = if state.current_senders < 24, do: 2.0, else: 1.5
     new_senders = min(round(state.current_senders * multiplier), state.max_senders)
 
-    # In rejections mode: only ramp senders, keep batch fixed
-    # In latency mode: ramp both
-    new_batch =
-      if state.mode == "rejections" do
-        state.current_batch_size
-      else
-        min(round(state.current_batch_size * 1.3), state.max_batch_size)
-      end
+    # Ramp both senders and batch, cap at --batch-size max
+    new_batch = min(round(state.current_batch_size * 1.3), state.max_batch_size)
 
     if new_senders == state.current_senders do
       IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} — holding\n")
