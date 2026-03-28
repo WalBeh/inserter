@@ -177,20 +177,24 @@ defmodule CrateWrite.PIDController do
     # Double until 24, then +50%
     multiplier = if state.current_senders < 24, do: 2.0, else: 1.5
     new_senders = min(round(state.current_senders * multiplier), state.max_senders)
-
-    # Also ramp batch during probe
     new_batch = min(round(state.current_batch_size * 1.3), state.max_batch_size)
 
-    IO.write(:stderr, "AUTO-TUNE: PROBE senders=#{state.current_senders}→#{new_senders} batch=#{state.current_batch_size}→#{new_batch} (p95 ok)\n")
+    # If we're already at max — nothing left to probe, enter HOLD
+    if new_senders == state.current_senders and new_batch == state.current_batch_size do
+      IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} — no rejections, holding\n")
+      %{state | phase: :hold}
+    else
+      IO.write(:stderr, "AUTO-TUNE: PROBE senders=#{state.current_senders}→#{new_senders} batch=#{state.current_batch_size}→#{new_batch} (p95 ok)\n")
 
-    state = set_senders(state, new_senders)
-    CrateWrite.GeneratorWorker.set_batch_size(new_batch)
+      state = set_senders(state, new_senders)
+      CrateWrite.GeneratorWorker.set_batch_size(new_batch)
 
-    %{state |
-      current_batch_size: new_batch,
-      adjustments: state.adjustments + 1,
-      batch_history: [new_batch | state.batch_history]
-    }
+      %{state |
+        current_batch_size: new_batch,
+        adjustments: state.adjustments + 1,
+        batch_history: [new_batch | state.batch_history]
+      }
+    end
   end
 
   # --- Phase 2: BISECT ---
