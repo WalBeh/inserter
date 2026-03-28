@@ -21,12 +21,12 @@ defmodule CrateWrite.PIDController do
     :current_senders,
     :current_batch_size,
     :sender_pids,
-    :phase,  # :probe | :bisect | :hold
-    # Bisection bounds
-    :good,   # highest sender count with P95 < target
-    :bad,    # lowest sender count with P95 > target
-    # Hold phase
-    :hold_throughput,  # throughput when we locked in
+    :phase,  # :probe | :probe_batch | :bisect | :bisect_batch | :hold
+    # Bisection bounds (for senders or batch depending on phase)
+    :good,   # highest value without issues
+    :bad,    # lowest value with issues
+    :good_batch,  # for batch bisection
+    :bad_batch,
     # Tracking
     :last_rejected,
     :adjustments,
@@ -55,15 +55,17 @@ defmodule CrateWrite.PIDController do
     last_rejected = CrateWrite.Cluster.get_rejected_writes(opts[:client])
     mode = opts[:mode] || "latency"
 
-    # In rejections mode, use the configured batch size (fixed throughout)
-    # In latency mode, start small and ramp up
+    # In rejections mode: --batch-size is the starting batch, grows until rejections
+    # In latency mode: start small (750), --batch-size is the max
     initial_batch = if mode == "rejections", do: opts[:max_batch_size], else: @initial_batch_size
+    # Max batch: in rejections mode, no hard cap (use 50K as safety); in latency mode, use --batch-size
+    max_batch = if mode == "rejections", do: 50_000, else: opts[:max_batch_size]
 
     state = %__MODULE__{
       client: opts[:client],
       insert_sql: opts[:insert_sql],
       max_senders: opts[:max_senders],
-      max_batch_size: opts[:max_batch_size],
+      max_batch_size: max_batch,
       latency_target_ms: opts[:latency_target_ms],
       batch_interval: opts[:batch_interval],
       mode: mode,
@@ -73,7 +75,8 @@ defmodule CrateWrite.PIDController do
       phase: :probe,
       good: @initial_senders,
       bad: nil,
-      hold_throughput: 0,
+      good_batch: initial_batch,
+      bad_batch: nil,
       last_rejected: last_rejected,
       adjustments: 0,
       emergency_brakes: 0,
@@ -133,7 +136,9 @@ defmodule CrateWrite.PIDController do
     else
       case state.phase do
         :probe -> probe(state)
+        :probe_batch -> probe_batch(state)
         :bisect -> bisect(state)
+        :bisect_batch -> bisect_batch(state)
         :hold -> hold(state)
       end
     end
@@ -192,8 +197,14 @@ defmodule CrateWrite.PIDController do
       end
 
     if new_senders == state.current_senders do
-      IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} — no rejections at max capacity, holding\n")
-      %{state | phase: :hold}
+      if state.mode == "rejections" do
+        # Senders maxed — now probe batch size
+        IO.write(:stderr, "AUTO-TUNE: MAX SENDERS=#{new_senders} — now probing batch size\n")
+        %{state | phase: :probe_batch, good_batch: state.current_batch_size}
+      else
+        IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} — no rejections at max capacity, holding\n")
+        %{state | phase: :hold}
+      end
     else
       IO.write(:stderr, "AUTO-TUNE: PROBE senders=#{state.current_senders}→#{new_senders} batch=#{new_batch}\n")
 
@@ -276,6 +287,52 @@ defmodule CrateWrite.PIDController do
     end
   end
 
+  # --- Phase 2b: PROBE_BATCH (rejections mode only) ---
+  # Senders are maxed. Now grow batch size until rejections appear.
+
+  defp probe_batch(state) do
+    new_batch = round(state.current_batch_size * 1.3)
+
+    if new_batch > state.max_batch_size do
+      IO.write(:stderr, "AUTO-TUNE: MAX BATCH=#{state.current_batch_size} — no rejections, holding\n")
+      %{state | phase: :hold}
+    else
+      IO.write(:stderr, "AUTO-TUNE: PROBE BATCH #{state.current_batch_size}→#{new_batch} senders=#{state.current_senders}\n")
+
+      CrateWrite.GeneratorWorker.set_batch_size(new_batch)
+
+      %{state |
+        current_batch_size: new_batch,
+        good_batch: state.current_batch_size,
+        adjustments: state.adjustments + 1,
+        batch_history: [new_batch | state.batch_history]
+      }
+    end
+  end
+
+  # --- Phase 2c: BISECT_BATCH (after rejections during batch probing) ---
+
+  defp bisect_batch(state) do
+    # No rejections at this batch size — it's good
+    good = max(state.current_batch_size, state.good_batch)
+    bad = state.bad_batch
+
+    IO.write(:stderr, "AUTO-TUNE: BISECT BATCH #{state.current_batch_size} OK bounds=[#{good}, #{bad}]\n")
+
+    range = bad - good
+
+    if range <= 100 do
+      IO.write(:stderr, "AUTO-TUNE: CONVERGED → senders=#{state.current_senders} batch=#{good}\n")
+      CrateWrite.GeneratorWorker.set_batch_size(good)
+      %{state | current_batch_size: good, good_batch: good, phase: :hold, adjustments: state.adjustments + 1}
+    else
+      mid = div(good + bad, 2)
+      IO.write(:stderr, "AUTO-TUNE: BISECT BATCH next=#{mid} (bounds=[#{good}, #{bad}])\n")
+      CrateWrite.GeneratorWorker.set_batch_size(mid)
+      %{state | current_batch_size: mid, good_batch: good, adjustments: state.adjustments + 1, batch_history: [mid | state.batch_history]}
+    end
+  end
+
   # --- Phase 3: HOLD ---
   # Stay at the converged optimal. Just hold steady.
   # No re-probing — the bisection found the ceiling, trust it.
@@ -288,24 +345,41 @@ defmodule CrateWrite.PIDController do
   # --- Emergency Brake ---
 
   defp emergency_brake(state, new_rejections) do
-    new_senders = max(round(state.current_senders * 0.75), 2)
-    new_batch = max(round(state.current_batch_size * 0.75), 100)
+    if state.phase in [:probe_batch, :bisect_batch] do
+      # Rejections during batch probing — bisect batch size, keep senders
+      good_batch = state.good_batch
+      bad_batch = state.current_batch_size
+      mid = div(good_batch + bad_batch, 2)
 
-    IO.write(:stderr, "AUTO-TUNE: BRAKE rejected=#{new_rejections} at senders=#{state.current_senders} — bisecting [#{new_senders}, #{state.current_senders}]\n")
+      IO.write(:stderr, "AUTO-TUNE: BRAKE rejected=#{new_rejections} at batch=#{bad_batch} — bisecting batch [#{good_batch}, #{bad_batch}]\n")
 
-    state = set_senders(state, new_senders)
-    CrateWrite.GeneratorWorker.set_batch_size(new_batch)
+      CrateWrite.GeneratorWorker.set_batch_size(mid)
 
-    # Re-enter bisection with current as bad, reduced as potential good
-    %{state |
-      current_batch_size: new_batch,
-      phase: :bisect,
-      bad: state.current_senders,
-      good: new_senders,
-      emergency_brakes: state.emergency_brakes + 1,
-      adjustments: state.adjustments + 1,
-      batch_history: [new_batch | state.batch_history]
-    }
+      %{state |
+        current_batch_size: mid,
+        phase: :bisect_batch,
+        good_batch: good_batch,
+        bad_batch: bad_batch,
+        emergency_brakes: state.emergency_brakes + 1,
+        adjustments: state.adjustments + 1,
+        batch_history: [mid | state.batch_history]
+      }
+    else
+      # Rejections during sender probing — bisect senders
+      new_senders = max(round(state.current_senders * 0.75), 2)
+
+      IO.write(:stderr, "AUTO-TUNE: BRAKE rejected=#{new_rejections} at senders=#{state.current_senders} — bisecting [#{new_senders}, #{state.current_senders}]\n")
+
+      state = set_senders(state, new_senders)
+
+      %{state |
+        phase: :bisect,
+        bad: state.current_senders,
+        good: new_senders,
+        emergency_brakes: state.emergency_brakes + 1,
+        adjustments: state.adjustments + 1
+      }
+    end
   end
 
   # --- Sender Management ---
