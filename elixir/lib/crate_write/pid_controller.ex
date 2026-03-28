@@ -192,7 +192,7 @@ defmodule CrateWrite.PIDController do
       end
 
     if new_senders == state.current_senders do
-      IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} — holding\n")
+      IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} — no rejections at max capacity, holding\n")
       %{state | phase: :hold}
     else
       IO.write(:stderr, "AUTO-TUNE: PROBE senders=#{state.current_senders}→#{new_senders} batch=#{new_batch}\n")
@@ -291,7 +291,7 @@ defmodule CrateWrite.PIDController do
     new_senders = max(round(state.current_senders * 0.75), 2)
     new_batch = max(round(state.current_batch_size * 0.75), 100)
 
-    IO.write(:stderr, "AUTO-TUNE: BRAKE rejected=#{new_rejections} senders=#{state.current_senders}→#{new_senders} batch=#{state.current_batch_size}→#{new_batch}\n")
+    IO.write(:stderr, "AUTO-TUNE: BRAKE rejected=#{new_rejections} at senders=#{state.current_senders} — bisecting [#{new_senders}, #{state.current_senders}]\n")
 
     state = set_senders(state, new_senders)
     CrateWrite.GeneratorWorker.set_batch_size(new_batch)
