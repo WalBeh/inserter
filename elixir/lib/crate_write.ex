@@ -126,22 +126,30 @@ defmodule CrateWrite do
     reporter_pid = spawn(fn -> reporter_loop(total_workers, quiet) end)
 
     # Wait for duration or Ctrl+C
+    # BEAM handles Ctrl+C via its own break handler. Trap SIGTERM for graceful shutdown.
     duration_ms = config.duration * 60_000
     main_pid = self()
 
-    {:ok, _} = System.trap_signal(:sigint, fn ->
-      send(main_pid, :interrupted)
-    end)
+    # Trap SIGTERM (e.g., from `kill` or container orchestrators)
+    try do
+      {:ok, _} = System.trap_signal(:sigterm, fn -> send(main_pid, :interrupted) end)
+    catch
+      _, _ -> :ok
+    end
+
+    # For Ctrl+C, configure the BEAM to not immediately exit
+    # by setting the process flag to trap exits
+    Process.flag(:trap_exit, true)
 
     receive do
       :interrupted ->
+        unless config.benchmark, do: IO.puts(:stderr, "Interrupted, stopping pipeline...")
+      {:EXIT, _, _} ->
         unless config.benchmark, do: IO.puts(:stderr, "Interrupted, stopping pipeline...")
     after
       duration_ms ->
         unless config.benchmark, do: IO.puts(:stderr, "Duration completed, stopping pipeline...")
     end
-
-    System.untrap_signal(:sigint)
 
     # Stop PID controller if running
     if config.auto_tune do
