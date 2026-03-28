@@ -1,14 +1,21 @@
 #!/bin/bash
 # Run Elixir benchmark from k8s pod, save results locally
-# Usage: ./bench-elixir.sh [shards] [replicas] [output_file]
-# Example: ./bench-elixir.sh 5 0 superbench.json
+# Usage: ./bench-elixir.sh <connection-string> [shards] [replicas] [output_file]
+# Example: ./bench-elixir.sh http://crate@localhost:4200 5 0 superbench.json
 
-SHARDS=${1:-5}
-REPLICAS=${2:-0}
-OUTFILE=${3:-superbench.json}
+if [ -z "$1" ]; then
+  echo "Usage: $0 <connection-string> [shards] [replicas] [output_file]" >&2
+  echo "Example: $0 http://crate@localhost:4200 5 0 results.json" >&2
+  exit 1
+fi
+
+CONN=$1
+SHARDS=${2:-5}
+REPLICAS=${3:-0}
+OUTFILE=${4:-superbench.json}
 TABLE="bench_s${SHARDS}_r${REPLICAS}_$(date +%H%M%S)"
 
-echo "Running: shards=$SHARDS replicas=$REPLICAS table=$TABLE → $OUTFILE" >&2
+echo "Running: cluster=$CONN shards=$SHARDS replicas=$REPLICAS table=$TABLE → $OUTFILE" >&2
 
 kubectl exec -n default elixir -- bash -c \
   "cd /inserter/elixir && mix run -e 'CrateWrite.main()' -- \
@@ -16,6 +23,7 @@ kubectl exec -n default elixir -- bash -c \
   --auto-tune \
   --auto-tune-mode rejections \
   --no-compression \
+  --connection-string '$CONN' \
   --table-name $TABLE \
   --duration 5 \
   --threads 128 \
