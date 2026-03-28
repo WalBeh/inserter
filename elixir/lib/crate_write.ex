@@ -219,6 +219,14 @@ defmodule CrateWrite do
     else
       Benchmark.output_normal_summary(config, final_stats, verification)
     end
+
+    # Clean up: drop the benchmark table
+    try do
+      Client.execute(client, "DROP TABLE IF EXISTS #{config.table_name}")
+      unless config.benchmark, do: IO.puts(:stderr, "Cleaned up table '#{config.table_name}'")
+    catch
+      _, _ -> :ok
+    end
   end
 
   defp reporter_loop(num_workers, quiet) do
