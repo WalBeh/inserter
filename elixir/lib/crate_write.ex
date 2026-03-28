@@ -123,10 +123,17 @@ defmodule CrateWrite do
       end
     end
 
-    # Start reporting/sampling timer (auto-tune logs its own output)
-    quiet = config.benchmark
-    total_workers = num_generators + num_senders
-    reporter_pid = spawn(fn -> reporter_loop(total_workers, quiet) end)
+    # Start reporting/sampling timer
+    # In auto-tune mode: skip reporter — PID controller's get_snapshot() collects samples
+    # Otherwise reporter would race with PID controller for the rate window
+    reporter_pid =
+      if config.auto_tune do
+        nil
+      else
+        quiet = config.benchmark
+        total_workers = num_generators + num_senders
+        spawn(fn -> reporter_loop(total_workers, quiet) end)
+      end
 
     # Wait for duration or Ctrl+C
     # BEAM handles Ctrl+C via its own break handler. Trap SIGTERM for graceful shutdown.
