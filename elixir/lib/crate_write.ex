@@ -154,7 +154,7 @@ defmodule CrateWrite do
         unless config.benchmark, do: IO.puts(:stderr, "Duration completed, stopping pipeline...")
     end
 
-    # Stop PID controller if running
+    # Get PID controller state and sender PIDs before stopping anything
     if config.auto_tune do
       pid_state = try do
         CrateWrite.PIDController.get_state()
@@ -163,6 +163,11 @@ defmodule CrateWrite do
       end
       Process.put(:auto_tune_state, pid_state)
 
+      # Kill all senders managed by PID controller
+      sender_pids = CrateWrite.PIDController.get_sender_pids()
+      for pid <- sender_pids, Process.alive?(pid), do: Process.exit(pid, :kill)
+
+      # Stop PID controller
       try do
         case Process.whereis(CrateWrite.PIDController) do
           nil -> :ok
@@ -175,11 +180,12 @@ defmodule CrateWrite do
 
     # Stop generators
     for pid <- generator_pids, Process.alive?(pid), do: Process.exit(pid, :kill)
-    Process.sleep(500)
 
     # Stop reporter
     if reporter_pid && Process.alive?(reporter_pid), do: Process.exit(reporter_pid, :kill)
-    Process.sleep(1000)
+
+    # Wait for in-flight requests to drain
+    Process.sleep(2000)
 
     # Collect final rate sample
     Monitor.get_current_stats()

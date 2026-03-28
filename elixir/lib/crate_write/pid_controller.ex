@@ -48,6 +48,12 @@ defmodule CrateWrite.PIDController do
     GenServer.call(__MODULE__, :get_state, 10_000)
   end
 
+  def get_sender_pids do
+    GenServer.call(__MODULE__, :get_sender_pids, 5_000)
+  catch
+    _, _ -> []
+  end
+
   # --- GenServer ---
 
   @impl true
@@ -121,6 +127,10 @@ defmodule CrateWrite.PIDController do
       batch_history: Enum.reverse(state.batch_history)
     }
     {:reply, result, state}
+  end
+
+  def handle_call(:get_sender_pids, _from, state) do
+    {:reply, state.sender_pids, state}
   end
 
   # --- Control Logic ---
