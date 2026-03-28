@@ -134,5 +134,6 @@ Note: 167 senders with batch 3621 is at the cluster's edge — high latency (5.7
 6. **Shards**: 4 shards was optimal for the 5-node cluster at this concurrency. Over-sharding (20) caused rejections.
 7. **Gzip compression**: essential over the network (~88% reduction), counterproductive on localhost/same-network.
 8. **Auto-tune** finds max safe concurrency but not necessarily optimal throughput — more senders isn't always faster.
-9. **Rejected writes** are the key health indicator — any > 0 means the cluster is overloaded.
-10. **Network bandwidth is almost always the bottleneck** from remote clients.
+9. **Rejected writes are unreliable on k8s** — when CrateDB runs in k8s with CPU limits, the kernel throttles the pods (up to 50% throttling observed) instead of CrateDB's write queue overflowing. Rejected writes stay at zero even when the cluster is at its ceiling. The real limiter is k8s CPU throttling, which can't be queried from CrateDB's sys tables. Auto-tune's rejections mode may never find a ceiling on throttled k8s clusters.
+10. **Uneven shard/disk distribution**: monitoring showed one node (data-hot-1 with 2TB volume) handling most disk I/O (586 IOPS, 34.8 MiB/s) while others were nearly idle. This suggests primary shards are concentrated on one node.
+11. **Network bandwidth is almost always the bottleneck** from remote clients.
