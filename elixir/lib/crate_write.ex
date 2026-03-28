@@ -125,16 +125,23 @@ defmodule CrateWrite do
     total_workers = num_generators + num_senders
     reporter_pid = spawn(fn -> reporter_loop(total_workers, quiet) end)
 
-    # Wait for duration
+    # Wait for duration or Ctrl+C
     duration_ms = config.duration * 60_000
+    main_pid = self()
 
-    try do
-      Process.sleep(duration_ms)
-      unless config.benchmark, do: IO.puts(:stderr, "Duration completed, stopping pipeline...")
-    catch
-      :exit, _ ->
+    {:ok, _} = System.trap_signal(:sigint, fn ->
+      send(main_pid, :interrupted)
+    end)
+
+    receive do
+      :interrupted ->
         unless config.benchmark, do: IO.puts(:stderr, "Interrupted, stopping pipeline...")
+    after
+      duration_ms ->
+        unless config.benchmark, do: IO.puts(:stderr, "Duration completed, stopping pipeline...")
     end
+
+    System.untrap_signal(:sigint)
 
     # Stop PID controller if running
     if config.auto_tune do
