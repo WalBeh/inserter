@@ -53,6 +53,11 @@ defmodule CrateWrite.PIDController do
   @impl true
   def init(opts) do
     last_rejected = CrateWrite.Cluster.get_rejected_writes(opts[:client])
+    mode = opts[:mode] || "latency"
+
+    # In rejections mode, use the configured batch size (fixed throughout)
+    # In latency mode, start small and ramp up
+    initial_batch = if mode == "rejections", do: opts[:max_batch_size], else: @initial_batch_size
 
     state = %__MODULE__{
       client: opts[:client],
@@ -61,9 +66,9 @@ defmodule CrateWrite.PIDController do
       max_batch_size: opts[:max_batch_size],
       latency_target_ms: opts[:latency_target_ms],
       batch_interval: opts[:batch_interval],
-      mode: opts[:mode] || "latency",
+      mode: mode,
       current_senders: @initial_senders,
-      current_batch_size: @initial_batch_size,
+      current_batch_size: initial_batch,
       sender_pids: [],
       phase: :probe,
       good: @initial_senders,
@@ -73,15 +78,15 @@ defmodule CrateWrite.PIDController do
       adjustments: 0,
       emergency_brakes: 0,
       sender_history: [@initial_senders],
-      batch_history: [@initial_batch_size],
+      batch_history: [initial_batch],
       peak_senders: @initial_senders
     }
 
-    CrateWrite.GeneratorWorker.set_batch_size(@initial_batch_size)
+    CrateWrite.GeneratorWorker.set_batch_size(initial_batch)
     state = spawn_n_senders(state, @initial_senders)
 
     mode_label = if state.mode == "rejections", do: "rejections-only", else: "latency target=#{state.latency_target_ms}ms"
-    IO.write(:stderr, "AUTO-TUNE: PROBE start senders=#{@initial_senders} batch=#{@initial_batch_size} mode=#{mode_label}\n")
+    IO.write(:stderr, "AUTO-TUNE: PROBE start senders=#{@initial_senders} batch=#{initial_batch} mode=#{mode_label}\n")
 
     Process.send_after(self(), :control_tick, @control_interval_ms)
     {:ok, state}
@@ -174,20 +179,29 @@ defmodule CrateWrite.PIDController do
   end
 
   defp ramp_up(state) do
-    # Double until 24, then +50%
     multiplier = if state.current_senders < 24, do: 2.0, else: 1.5
     new_senders = min(round(state.current_senders * multiplier), state.max_senders)
-    new_batch = min(round(state.current_batch_size * 1.3), state.max_batch_size)
 
-    # If we're already at max — nothing left to probe, enter HOLD
-    if new_senders == state.current_senders and new_batch == state.current_batch_size do
-      IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} — no rejections, holding\n")
+    # In rejections mode: only ramp senders, keep batch fixed
+    # In latency mode: ramp both
+    new_batch =
+      if state.mode == "rejections" do
+        state.current_batch_size
+      else
+        min(round(state.current_batch_size * 1.3), state.max_batch_size)
+      end
+
+    if new_senders == state.current_senders do
+      IO.write(:stderr, "AUTO-TUNE: MAX REACHED senders=#{new_senders} batch=#{new_batch} — holding\n")
       %{state | phase: :hold}
     else
-      IO.write(:stderr, "AUTO-TUNE: PROBE senders=#{state.current_senders}→#{new_senders} batch=#{state.current_batch_size}→#{new_batch} (p95 ok)\n")
+      IO.write(:stderr, "AUTO-TUNE: PROBE senders=#{state.current_senders}→#{new_senders} batch=#{new_batch}\n")
 
       state = set_senders(state, new_senders)
-      CrateWrite.GeneratorWorker.set_batch_size(new_batch)
+
+      if new_batch != state.current_batch_size do
+        CrateWrite.GeneratorWorker.set_batch_size(new_batch)
+      end
 
       %{state |
         current_batch_size: new_batch,
