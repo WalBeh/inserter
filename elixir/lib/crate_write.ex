@@ -89,16 +89,19 @@ defmodule CrateWrite do
       # Auto-tune mode: PID controller manages senders dynamically
       latency_target_ms = round(config.latency_target * 1000)
 
+      # In auto-tune mode, --threads is the max senders ceiling (generators are separate)
+      max_senders = config.threads
+
       unless config.benchmark do
-        IO.puts(:stderr, "AUTO-TUNE: starting with 6 senders, target P95 latency #{config.latency_target}s")
-        IO.puts(:stderr, "AUTO-TUNE: max senders=#{num_senders}, max batch=#{config.batch_size}")
+        IO.puts(:stderr, "AUTO-TUNE: starting with 12 senders, target P95 latency #{config.latency_target}s")
+        IO.puts(:stderr, "AUTO-TUNE: max senders=#{max_senders}, max batch=#{config.batch_size}")
       end
 
       {:ok, _pid} = CrateWrite.PIDController.start_link(
         client: client,
         insert_sql: insert_sql,
         generator: generator,
-        max_senders: num_senders,
+        max_senders: max_senders,
         max_batch_size: config.batch_size,
         latency_target_ms: latency_target_ms,
         batch_interval: config.batch_interval,
