@@ -21,6 +21,27 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source $HOME/.cargo/env
 ```
 
+### Kubernetes / Docker
+```bash
+# Run a pod with Rust pre-installed
+kubectl run rust --image rust:slim -- sleep infinity
+kubectl exec -it rust -- bash
+
+# Inside the pod:
+apt update && apt install -y git gcc libssl-dev pkg-config
+git clone https://github.com/WalBeh/inserter.git && cd inserter/rust
+cargo build --release
+
+# Run benchmark
+./target/release/crate-write --benchmark --no-compression \
+  --connection-string "http://crate@your-cratedb-host:4200" \
+  --table-name bench --duration 5 --threads 128 --batch-size 1000 \
+  --batch-interval 0 --shards 5 --replicas 0
+
+# When done:
+# kubectl delete pod rust
+```
+
 ## Build & Run
 
 ```bash
