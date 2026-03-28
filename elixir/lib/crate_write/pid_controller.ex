@@ -212,10 +212,10 @@ defmodule CrateWrite.PIDController do
           if rate > state.peak_rate, do: %{state | latency_worse_count: 0}, else: state
         end
 
-      should_revert = state.below_peak_count >= 3 or state.latency_worse_count >= 3
+      should_revert = state.below_peak_count >= 3 or state.latency_worse_count >= 2
 
       if should_revert do
-        reason = if state.latency_worse_count >= 3, do: "latency 3x+ worse", else: "rate dropped"
+        reason = if state.latency_worse_count >= 2, do: "latency 3x+ worse", else: "rate dropped"
         IO.write(:stderr, "AUTO-TUNE: PEAK FOUND rate=#{round(state.peak_rate)}rec/s p95=#{round(state.peak_rate_p95)}ms at senders=#{state.peak_rate_senders} — reverting (#{reason}) [#{format_stats(current_stats)}]\n")
 
         state = set_senders(state, state.peak_rate_senders)
@@ -411,10 +411,10 @@ defmodule CrateWrite.PIDController do
         if rate > state.peak_rate, do: %{state | latency_worse_count: 0}, else: state
       end
 
-    should_revert = state.below_peak_count >= 3 or state.latency_worse_count >= 3
+    should_revert = state.below_peak_count >= 3 or state.latency_worse_count >= 2
 
     if should_revert do
-      reason = if state.latency_worse_count >= 3, do: "latency 3x+ worse", else: "rate dropped"
+      reason = if state.latency_worse_count >= 2, do: "latency 3x+ worse", else: "rate dropped"
       IO.write(:stderr, "AUTO-TUNE: PEAK BATCH rate=#{round(state.peak_rate)}rec/s p95=#{round(state.peak_rate_p95)}ms at batch=#{state.peak_rate_batch} — reverting (#{reason}) [#{format_stats(current_stats)}]\n")
 
       CrateWrite.GeneratorWorker.set_batch_size(state.peak_rate_batch)
@@ -429,8 +429,15 @@ defmodule CrateWrite.PIDController do
       new_batch = round(state.current_batch_size * 1.3)
 
       if new_batch > state.max_batch_size do
-        IO.write(:stderr, "AUTO-TUNE: MAX BATCH=#{state.current_batch_size} [#{format_stats(current_stats)}] — holding\n")
-        %{state | phase: :hold}
+        # At max batch — but if current rate is below peak, revert to peak config
+        if state.peak_rate > 0 and rate < state.peak_rate * 0.9 do
+          IO.write(:stderr, "AUTO-TUNE: MAX BATCH but rate degraded — reverting to peak batch=#{state.peak_rate_batch} [#{format_stats(current_stats)}]\n")
+          CrateWrite.GeneratorWorker.set_batch_size(state.peak_rate_batch)
+          %{state | current_batch_size: state.peak_rate_batch, phase: :hold, adjustments: state.adjustments + 1}
+        else
+          IO.write(:stderr, "AUTO-TUNE: MAX BATCH=#{state.current_batch_size} [#{format_stats(current_stats)}] — holding\n")
+          %{state | phase: :hold}
+        end
       else
         IO.write(:stderr, "AUTO-TUNE: PROBE BATCH #{state.current_batch_size}→#{new_batch} senders=#{state.current_senders} [#{format_stats(current_stats)}]\n")
 
