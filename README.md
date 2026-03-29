@@ -1,17 +1,17 @@
 # CrateDB Record Generator
 
-High-performance record generators for CrateDB. Available in Python (async) and Rust, both optimized for maximum insert throughput.
+High-performance record generators for CrateDB. Available in Python (async) and two Rust variants: the original HTTP inserter in `./rust` and a PostgreSQL wire protocol inserter in `./rust-pg`.
 
 ## Implementations
 
 | | Python (async) | Rust |
 |---|---|---|
-| **Engine** | asyncio + aiohttp | tokio + reqwest + spawn_blocking |
-| **Concurrency** | Async tasks (no GIL) | Async I/O + blocking thread pool |
-| **Compression** | gzip level 1 | flate2 fast |
-| **Throughput** | ~33,000 rec/sec | ~34,000 rec/sec |
-| **Memory** | ~30-100MB | ~5-50MB |
-| **Setup** | `uv run crate-write` | `cargo run` |
+| **Engine** | asyncio + aiohttp | `./rust`: tokio + reqwest + spawn_blocking / `./rust-pg`: postgres wire protocol |
+| **Concurrency** | Async tasks (no GIL) | `./rust`: async I/O + blocking thread pool / `./rust-pg`: threaded PG batches |
+| **Compression** | gzip level 1 | `./rust`: flate2 fast / `./rust-pg`: none |
+| **Throughput** | ~33,000 rec/sec | depends on variant + cluster |
+| **Memory** | ~30-100MB | `./rust`: ~5-50MB / `./rust-pg`: low |
+| **Setup** | `uv run crate-write` | `cargo run` (HTTP) or `cd rust-pg && cargo run` (PG wire) |
 
 Both share the same CLI interface, table schema, and record format. Throughput numbers from a 3-node CrateDB Cloud cluster (cr2, 2 TiB EBS gp3, AWS NLB, us-east-1). Actual throughput depends on network latency and bandwidth between client and cluster.
 
@@ -31,7 +31,7 @@ echo 'CRATE_CONNECTION_STRING=https://admin:password@your-cluster:4200' > .env
 uv run crate-write --table-name test_events --duration 1 --threads 64 --batch-size 1000 --batch-interval 0
 ```
 
-### Rust
+### Rust HTTP variant
 
 ```bash
 cd rust
@@ -51,6 +51,18 @@ EOF
 
 # Run (reads config.toml automatically)
 cargo run
+```
+
+### Rust PG-wire variant
+
+```bash
+cd rust-pg
+
+# Configure connection (postgres://host:5432/db?sslmode=require)
+echo 'CRATE_CONNECTION_STRING=postgres://crate:password@your-cratedb-host:5432/doc?sslmode=require' > .env
+
+# Run
+cargo run -- --table-name bench --duration 1 --threads 4 --batch-size 1000 --batch-interval 0
 ```
 
 ## Configuration
@@ -188,6 +200,11 @@ Creates fresh TCP connections to test whether the load balancer distributes traf
 │   │   ├── monitor.rs         # Atomic counters + percentile stats
 │   │   └── config.rs          # TOML/JSON config loading
 │   ├── config.toml            # Default config (gitignored)
+│   └── Cargo.toml
+├── rust-pg/
+│   ├── src/
+│   │   ├── main.rs           # PostgreSQL wire protocol batch inserter
+│   │   └── generator.rs      # Shared record generation
 │   └── Cargo.toml
 ├── pyproject.toml
 ├── BENCHMARKS.md              # Performance comparison data
