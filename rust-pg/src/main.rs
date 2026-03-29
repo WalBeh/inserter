@@ -3,7 +3,6 @@ use clap::Parser;
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Statement};
 use postgres_native_tls::MakeTlsConnector;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -87,9 +86,6 @@ fn quote_ident(ident: &str) -> String {
 
 fn default_pg_port(url: &Url) -> u16 {
     match url.scheme() {
-        // CrateDB HTTP is often on 4200, but the PostgreSQL wire protocol is usually 5432.
-        // For postgres/postgresql URLs we keep 5432; for http(s) we still prefer 5432 so the
-        // user can point at a PG-enabled endpoint directly.
         "http" | "https" => 5432,
         _ => 5432,
     }
@@ -154,7 +150,7 @@ fn record_to_pg(record: Record) -> PgRecord {
         user_segment: record.user_segment,
         amount: record.amount,
         quantity: record.quantity as i32,
-        metadata: record.metadata.to_string(),
+        metadata: record.metadata,
         objects: record.objects,
     }
 }
@@ -192,28 +188,21 @@ fn create_table_sql(table_name: &str, shards: usize, replicas: usize, object_cou
 }
 
 fn build_insert_sql(table_name: &str, rows: usize, object_count: usize) -> String {
-    let column_names = {
-        let mut cols = vec![
-            "id",
-            "timestamp",
-            "region",
-            "product_category",
-            "event_type",
-            "user_id",
-            "user_segment",
-            "amount",
-            "quantity",
-            "metadata",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<_>>();
-
-        for i in 0..object_count {
-            cols.push(format!("obj_{i}"));
-        }
-        cols
-    };
+    let mut column_names = vec![
+        "id".to_string(),
+        "timestamp".to_string(),
+        "region".to_string(),
+        "product_category".to_string(),
+        "event_type".to_string(),
+        "user_id".to_string(),
+        "user_segment".to_string(),
+        "amount".to_string(),
+        "quantity".to_string(),
+        "metadata".to_string(),
+    ];
+    for i in 0..object_count {
+        column_names.push(format!("obj_{i}"));
+    }
 
     let mut values = Vec::with_capacity(rows);
     let mut param = 1usize;
@@ -238,54 +227,34 @@ fn build_insert_sql(table_name: &str, rows: usize, object_count: usize) -> Strin
     )
 }
 
-fn box_params(records: &[PgRecord]) -> Vec<Box<dyn ToSql + Sync>> {
-    let mut out: Vec<Box<dyn ToSql + Sync>> = Vec::with_capacity(records.len() * 10);
+fn build_params_refs<'a>(records: &'a [PgRecord], object_count: usize) -> Vec<&'a (dyn ToSql + Sync)> {
+    let mut out: Vec<&'a (dyn ToSql + Sync)> = Vec::with_capacity(records.len() * (10 + object_count));
 
     for record in records {
-        out.push(Box::new(record.id.clone()));
-        out.push(Box::new(record.timestamp));
-        out.push(Box::new(record.region.clone()));
-        out.push(Box::new(record.product_category.clone()));
-        out.push(Box::new(record.event_type.clone()));
-        out.push(Box::new(record.user_id));
-        out.push(Box::new(record.user_segment.clone()));
-        out.push(Box::new(record.amount));
-        out.push(Box::new(record.quantity));
-        out.push(Box::new(record.metadata.clone()));
+        out.push(&record.id as &(dyn ToSql + Sync));
+        out.push(&record.timestamp as &(dyn ToSql + Sync));
+        out.push(&record.region as &(dyn ToSql + Sync));
+        out.push(&record.product_category as &(dyn ToSql + Sync));
+        out.push(&record.event_type as &(dyn ToSql + Sync));
+        out.push(&record.user_id as &(dyn ToSql + Sync));
+        out.push(&record.user_segment as &(dyn ToSql + Sync));
+        out.push(&record.amount as &(dyn ToSql + Sync));
+        out.push(&record.quantity as &(dyn ToSql + Sync));
+        out.push(&record.metadata as &(dyn ToSql + Sync));
         for obj in &record.objects {
-            out.push(Box::new(obj.clone()));
+            out.push(obj as &(dyn ToSql + Sync));
         }
     }
 
     out
 }
 
-fn execute_batch(
-    client: &mut Client,
-    stmt_cache: &mut HashMap<usize, Statement>,
-    table_name: &str,
-    object_count: usize,
-    records: &[PgRecord],
-) -> Result<u64> {
+fn execute_batch(client: &mut Client, stmt: &Statement, records: &[PgRecord], object_count: usize) -> Result<u64> {
     if records.is_empty() {
         return Ok(0);
     }
 
-    let row_count = records.len();
-    if !stmt_cache.contains_key(&row_count) {
-        let sql = build_insert_sql(table_name, row_count, object_count);
-        let stmt = client
-            .prepare(&sql)
-            .with_context(|| format!("failed to prepare batch statement for {} rows", row_count))?;
-        stmt_cache.insert(row_count, stmt);
-    }
-
-    let stmt = stmt_cache
-        .get(&row_count)
-        .expect("statement inserted into cache");
-
-    let boxed = box_params(records);
-    let params: Vec<&(dyn ToSql + Sync)> = boxed.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
+    let params = build_params_refs(records, object_count);
     let inserted = client
         .execute(stmt, &params)
         .context("failed to execute batch insert")?;
@@ -314,8 +283,17 @@ fn worker(
         }
     };
 
-    let generator = RecordGenerator::new(object_count);
-    let mut stmt_cache: HashMap<usize, Statement> = HashMap::new();
+    let mut generator = RecordGenerator::new(object_count);
+    let insert_sql = build_insert_sql(&table_name, batch_size, object_count);
+    let stmt = match client.prepare(&insert_sql) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            eprintln!("worker {worker_id}: prepare failed: {err:#}");
+            errors.fetch_add(1, Ordering::Relaxed);
+            stop.store(true, Ordering::Relaxed);
+            return;
+        }
+    };
 
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         let records: Vec<PgRecord> = generator
@@ -324,7 +302,7 @@ fn worker(
             .map(record_to_pg)
             .collect();
 
-        match execute_batch(&mut client, &mut stmt_cache, &table_name, object_count, &records) {
+        match execute_batch(&mut client, &stmt, &records, object_count) {
             Ok(inserted) => {
                 total_rows.fetch_add(inserted, Ordering::Relaxed);
             }
