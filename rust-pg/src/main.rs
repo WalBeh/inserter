@@ -694,6 +694,13 @@ fn main() -> Result<()> {
         info!("inserted {rows} rows in {elapsed:.2}s ({rps:.0} rows/sec), errors={err_count}");
     }
 
+    // Clean up: drop the benchmark table
+    let drop_sql = format!("DROP TABLE IF EXISTS {}", quote_ident(&cli.table_name));
+    match admin_client.batch_execute(&drop_sql) {
+        Ok(_) => info!("Cleaned up table '{}'", cli.table_name),
+        Err(e) => warn!("Failed to drop table: {}", e),
+    }
+
     Ok(())
 }
 
