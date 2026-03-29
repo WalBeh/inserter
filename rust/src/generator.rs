@@ -63,7 +63,8 @@ impl RecordGenerator {
 
         // Select random values with controlled cardinality
         let region = self.regions[(0..self.regions.len()).fake::<usize>()];
-        let product_category = self.product_categories[(0..self.product_categories.len()).fake::<usize>()];
+        let product_category =
+            self.product_categories[(0..self.product_categories.len()).fake::<usize>()];
         let event_type = self.event_types[(0..self.event_types.len()).fake::<usize>()];
         let user_segment = self.user_segments[(0..self.user_segments.len()).fake::<usize>()];
 

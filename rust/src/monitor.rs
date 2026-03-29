@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -69,7 +69,9 @@ impl PerformanceMonitor {
 
     /// Lock-free: no contention between workers
     pub fn add_records(&self, count: usize) {
-        self.counters.total_records.fetch_add(count as u64, Ordering::Relaxed);
+        self.counters
+            .total_records
+            .fetch_add(count as u64, Ordering::Relaxed);
         self.counters.total_batches.fetch_add(1, Ordering::Relaxed);
         debug!("Added {} records", count);
     }
@@ -81,7 +83,9 @@ impl PerformanceMonitor {
 
     /// Track bytes sent and request latency (latency needs lock, but batched)
     pub async fn add_request_stats(&self, bytes_sent: usize, latency_ms: f64) {
-        self.counters.total_bytes_sent.fetch_add(bytes_sent as u64, Ordering::Relaxed);
+        self.counters
+            .total_bytes_sent
+            .fetch_add(bytes_sent as u64, Ordering::Relaxed);
         let mut timing = self.timing.write().await;
         timing.latency_samples.push(latency_ms);
     }
@@ -179,7 +183,9 @@ impl PerformanceMonitor {
     pub async fn get_bandwidth_mbps(&self) -> f64 {
         let bytes = self.counters.total_bytes_sent.load(Ordering::Relaxed);
         let timing = self.timing.read().await;
-        let elapsed = Instant::now().duration_since(timing.start_time).as_secs_f64();
+        let elapsed = Instant::now()
+            .duration_since(timing.start_time)
+            .as_secs_f64();
         if elapsed > 0.0 {
             (bytes as f64 * 8.0 / 1_000_000.0) / elapsed
         } else {
@@ -193,7 +199,13 @@ impl PerformanceMonitor {
 
     fn compute_percentiles(samples: &[f64]) -> PercentileStats {
         if samples.is_empty() {
-            return PercentileStats { avg: 0.0, min: 0.0, max: 0.0, p90: 0.0, p95: 0.0 };
+            return PercentileStats {
+                avg: 0.0,
+                min: 0.0,
+                max: 0.0,
+                p90: 0.0,
+                p95: 0.0,
+            };
         }
         let mut sorted: Vec<f64> = samples.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
