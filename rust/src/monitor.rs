@@ -310,7 +310,6 @@ pub struct QueueThrottleConfig {
     pub enabled: bool,
     pub capacity: u64,
     pub threshold_pct: f64,
-    pub max_throttle_us: u64,
 }
 
 /// Monitors CrateDB write thread pool by polling sys.nodes during the benchmark.
@@ -318,17 +317,20 @@ pub struct ThreadPoolMonitor {
     client: CrateClient,
     samples: Arc<RwLock<std::collections::BTreeMap<String, Vec<NodeSample>>>>,
     baseline: Arc<RwLock<Vec<NodePoolCounters>>>,
-    /// Current throttle sleep in microseconds, read by workers.
-    pub throttle_us: Arc<AtomicU64>,
+    /// Semaphore controlling max concurrent in-flight requests.
+    pub concurrency_sem: Arc<tokio::sync::Semaphore>,
+    /// Current target concurrency (for reporting).
+    pub current_concurrency: Arc<AtomicU64>,
 }
 
 impl ThreadPoolMonitor {
-    pub fn new(client: CrateClient) -> Self {
+    pub fn new(client: CrateClient, max_concurrency: usize) -> Self {
         Self {
             client,
             samples: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             baseline: Arc::new(RwLock::new(Vec::new())),
-            throttle_us: Arc::new(AtomicU64::new(0)),
+            concurrency_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrency)),
+            current_concurrency: Arc::new(AtomicU64::new(max_concurrency as u64)),
         }
     }
 
@@ -345,8 +347,11 @@ impl ThreadPoolMonitor {
     ) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let samples = self.samples.clone();
-        let throttle_us = self.throttle_us.clone();
-        let mut current_throttle: f64 = 0.0;
+        let sem = self.concurrency_sem.clone();
+        let current_concurrency = self.current_concurrency.clone();
+        let max_concurrency = current_concurrency.load(Ordering::Relaxed) as usize;
+        // We hold "stolen" permits here to reduce concurrency
+        let mut stolen_permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -370,35 +375,57 @@ impl ThreadPoolMonitor {
                                     smap.entry(name).or_default().push(NodeSample { active, queue });
                                 }
                             }
+                            drop(smap); // release write lock before permit operations
 
-                            // Update throttle if enabled
                             if throttle_config.enabled && node_count > 0 {
-                                // Use the average queue across nodes
                                 let avg_queue = total_queue as f64 / node_count as f64;
                                 let queue_pct = avg_queue / throttle_config.capacity as f64;
 
-                                if queue_pct > throttle_config.threshold_pct {
-                                    // Pressure: jump directly to proportional target
-                                    let overshoot = (queue_pct - throttle_config.threshold_pct)
+                                // Desired concurrency: linearly scale down from max when over threshold
+                                let desired = if queue_pct > throttle_config.threshold_pct {
+                                    let pressure = (queue_pct - throttle_config.threshold_pct)
                                         / (1.0 - throttle_config.threshold_pct);
-                                    let target = overshoot * throttle_config.max_throttle_us as f64;
-                                    // Always take the higher of current or target (never reduce under pressure)
-                                    current_throttle = current_throttle.max(target);
+                                    // Scale from max_concurrency down to min_concurrency (25% of max)
+                                    let min_concurrency = (max_concurrency as f64 * 0.25).ceil() as usize;
+                                    let target = max_concurrency as f64 - pressure * (max_concurrency - min_concurrency) as f64;
+                                    (target as usize).max(min_concurrency)
+                                } else if queue_pct < throttle_config.threshold_pct * 0.5 {
+                                    // Well below threshold: restore toward max (release 1 permit per tick)
+                                    let current = max_concurrency - stolen_permits.len();
+                                    (current + 1).min(max_concurrency)
                                 } else {
-                                    // Headroom: slow decay (10% per second)
-                                    current_throttle *= 0.9;
+                                    // Between 50% of threshold and threshold: hold steady
+                                    max_concurrency - stolen_permits.len()
+                                };
+
+                                let current = max_concurrency - stolen_permits.len();
+
+                                if desired < current {
+                                    // Need to reduce: steal permits
+                                    let to_steal = current - desired;
+                                    for _ in 0..to_steal {
+                                        if let Ok(permit) = sem.clone().try_acquire_owned() {
+                                            stolen_permits.push(permit);
+                                        }
+                                    }
+                                } else if desired > current && !stolen_permits.is_empty() {
+                                    // Need to increase: release stolen permits
+                                    let to_release = (desired - current).min(stolen_permits.len());
+                                    stolen_permits.truncate(stolen_permits.len() - to_release);
                                 }
 
-                                // Clamp and store
-                                let clamped = current_throttle
-                                    .max(0.0)
-                                    .min(throttle_config.max_throttle_us as f64) as u64;
-                                throttle_us.store(clamped, Ordering::Relaxed);
+                                current_concurrency.store(
+                                    (max_concurrency - stolen_permits.len()) as u64,
+                                    Ordering::Relaxed,
+                                );
                             }
                         }
                     }
                 }
             }
+
+            // Release all stolen permits on shutdown
+            drop(stolen_permits);
         })
     }
 
