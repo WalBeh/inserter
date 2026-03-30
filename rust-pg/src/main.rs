@@ -291,63 +291,74 @@ fn find_write_pool(pools: &JsonValue) -> Option<&serde_json::Map<String, JsonVal
 
 /// Query thread_pools from sys.nodes. CrateDB returns ARRAY(OBJECT) as text
 /// over the PG wire protocol; we parse it as JSON.
-fn query_thread_pools_parsed(client: &mut Client) -> Vec<(String, JsonValue)> {
-    let sql = "SELECT name, thread_pools::text FROM sys.nodes ORDER BY name";
-    let rows = match client.query(sql, &[]) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[tp-debug] query failed: {}", e);
-            return Vec::new();
-        }
-    };
+/// Thread pool data queried via scalar fields (avoids ARRAY(OBJECT) casting issues over PG wire).
+struct ThreadPoolRow {
+    node_name: String,
+    active: i64,
+    queue: i64,
+    threads: i64,
+    completed: i64,
+    rejected: i64,
+}
 
-    rows.iter()
-        .filter_map(|row| {
-            let name: String = row.try_get(0).ok()?;
-            let text: String = match row.try_get(1) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("[tp-debug] try_get failed for {}: {}", name, e);
-                    return None;
-                }
-            };
-            let pools: JsonValue = match serde_json::from_str(&text) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("[tp-debug] JSON parse failed: {} (raw: {})", e, &text[..text.len().min(200)]);
-                    return None;
-                }
-            };
-            Some((name, pools))
-        })
-        .collect()
+fn query_thread_pool_rows(client: &mut Client) -> Vec<ThreadPoolRow> {
+    // Query each write-pool field individually using array_agg + filter workaround.
+    // CrateDB doesn't support UNNEST in FROM over PG wire, so use a scalar approach:
+    // the thread_pools column has a known structure, query via subscript on unnested subselect.
+    let sql = r#"
+        SELECT
+            x.name,
+            x.pool['active']::bigint,
+            x.pool['queue']::bigint,
+            x.pool['threads']::bigint,
+            x.pool['completed']::bigint,
+            x.pool['rejected']::bigint
+        FROM (
+            SELECT name, UNNEST(thread_pools) AS pool FROM sys.nodes
+        ) x
+        WHERE x.pool['name'] = 'write'
+        ORDER BY x.name
+    "#;
+    match client.query(sql, &[]) {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|row| {
+                Some(ThreadPoolRow {
+                    node_name: row.try_get(0).ok()?,
+                    active: row.try_get(1).ok()?,
+                    queue: row.try_get(2).ok()?,
+                    threads: row.try_get(3).ok()?,
+                    completed: row.try_get(4).ok()?,
+                    rejected: row.try_get(5).ok()?,
+                })
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("[tp-debug] thread pool query failed: {}", e);
+            Vec::new()
+        }
+    }
 }
 
 fn query_thread_pool_counters(client: &mut Client) -> Vec<NodePoolCounters> {
-    query_thread_pools_parsed(client)
+    query_thread_pool_rows(client)
         .into_iter()
-        .filter_map(|(name, pools)| {
-            let pool = find_write_pool(&pools)?;
-            Some(NodePoolCounters {
-                name,
-                pool_size: pool.get("threads").and_then(|v| v.as_u64()).unwrap_or(0),
-                completed: pool.get("completed").and_then(|v| v.as_u64()).unwrap_or(0),
-                rejected: pool.get("rejected").and_then(|v| v.as_u64()).unwrap_or(0),
-            })
+        .map(|r| NodePoolCounters {
+            name: r.node_name,
+            pool_size: r.threads.max(0) as u64,
+            completed: r.completed.max(0) as u64,
+            rejected: r.rejected.max(0) as u64,
         })
         .collect()
 }
 
 fn poll_thread_pool_samples(client: &mut Client) -> Vec<(String, NodeSample)> {
-    query_thread_pools_parsed(client)
+    query_thread_pool_rows(client)
         .into_iter()
-        .filter_map(|(name, pools)| {
-            let pool = find_write_pool(&pools)?;
-            Some((name, NodeSample {
-                active: pool.get("active").and_then(|v| v.as_u64()).unwrap_or(0),
-                queue: pool.get("queue").and_then(|v| v.as_u64()).unwrap_or(0),
-            }))
-        })
+        .map(|r| (r.node_name, NodeSample {
+            active: r.active.max(0) as u64,
+            queue: r.queue.max(0) as u64,
+        }))
         .collect()
 }
 
