@@ -304,11 +304,22 @@ pub struct ClusterThreadPoolStats {
     pub nodes: Vec<NodeThreadPoolStats>,
 }
 
+/// Configuration for queue-based throttling.
+#[derive(Debug, Clone)]
+pub struct QueueThrottleConfig {
+    pub enabled: bool,
+    pub capacity: u64,
+    pub threshold_pct: f64,
+    pub max_throttle_us: u64,
+}
+
 /// Monitors CrateDB write thread pool by polling sys.nodes during the benchmark.
 pub struct ThreadPoolMonitor {
     client: CrateClient,
     samples: Arc<RwLock<std::collections::BTreeMap<String, Vec<NodeSample>>>>,
     baseline: Arc<RwLock<Vec<NodePoolCounters>>>,
+    /// Current throttle sleep in microseconds, read by workers.
+    pub throttle_us: Arc<AtomicU64>,
 }
 
 impl ThreadPoolMonitor {
@@ -317,6 +328,7 @@ impl ThreadPoolMonitor {
             client,
             samples: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             baseline: Arc::new(RwLock::new(Vec::new())),
+            throttle_us: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -329,9 +341,12 @@ impl ThreadPoolMonitor {
     pub fn spawn_poller(
         &self,
         mut shutdown_rx: broadcast::Receiver<()>,
+        throttle_config: QueueThrottleConfig,
     ) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let samples = self.samples.clone();
+        let throttle_us = self.throttle_us.clone();
+        let mut current_throttle: f64 = 0.0;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -342,14 +357,44 @@ impl ThreadPoolMonitor {
                         if let Ok(rows) = client.execute_query(
                             "SELECT name, thread_pools FROM sys.nodes ORDER BY name"
                         ).await {
+                            let mut total_queue: u64 = 0;
+                            let mut node_count: u64 = 0;
                             let mut smap = samples.write().await;
                             for row in &rows {
                                 let name = row.first().and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
                                 if let Some(pool) = find_write_pool(row.get(1)) {
                                     let active = pool.get("active").and_then(|v| v.as_u64()).unwrap_or(0);
                                     let queue = pool.get("queue").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    total_queue += queue;
+                                    node_count += 1;
                                     smap.entry(name).or_default().push(NodeSample { active, queue });
                                 }
+                            }
+
+                            // Update throttle if enabled
+                            if throttle_config.enabled && node_count > 0 {
+                                // Use the average queue across nodes
+                                let avg_queue = total_queue as f64 / node_count as f64;
+                                let queue_pct = avg_queue / throttle_config.capacity as f64;
+
+                                if queue_pct > throttle_config.threshold_pct {
+                                    // Pressure: ramp up fast
+                                    let overshoot = (queue_pct - throttle_config.threshold_pct)
+                                        / (1.0 - throttle_config.threshold_pct);
+                                    let target = overshoot * throttle_config.max_throttle_us as f64;
+                                    // Fast up: jump to at least 70% old + 30% new, or new if higher
+                                    current_throttle = (0.7 * current_throttle + 0.3 * target)
+                                        .max(current_throttle.min(target));
+                                } else {
+                                    // Headroom: slow decay
+                                    current_throttle *= 0.9;
+                                }
+
+                                // Clamp and store
+                                let clamped = current_throttle
+                                    .max(0.0)
+                                    .min(throttle_config.max_throttle_us as f64) as u64;
+                                throttle_us.store(clamped, Ordering::Relaxed);
                             }
                         }
                     }

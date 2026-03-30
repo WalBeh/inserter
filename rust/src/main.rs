@@ -20,7 +20,7 @@ mod monitor;
 use client::CrateClient;
 use config::Config;
 use generator::RecordGenerator;
-use monitor::{PerformanceMonitor, ThreadPoolMonitor};
+use monitor::{PerformanceMonitor, QueueThrottleConfig, ThreadPoolMonitor};
 
 #[derive(Parser)]
 #[command(
@@ -124,6 +124,22 @@ struct Cli {
     /// Disable gzip compression (faster on localhost/low-latency)
     #[arg(long)]
     no_compression: bool,
+
+    /// Enable queue-based throttling (adjusts worker sleep based on write queue depth)
+    #[arg(long)]
+    queue_throttle: bool,
+
+    /// Write thread pool queue capacity (default: 200, matches CrateDB default)
+    #[arg(long, default_value_t = 200)]
+    queue_capacity: u64,
+
+    /// Queue fill percentage at which throttling starts (default: 50)
+    #[arg(long, default_value_t = 50)]
+    queue_throttle_pct: u64,
+
+    /// Maximum throttle sleep in milliseconds (default: 30)
+    #[arg(long, default_value_t = 30)]
+    queue_throttle_max_ms: u64,
 }
 
 fn sanitize_connection_string(connection_string: &str) -> String {
@@ -274,6 +290,7 @@ async fn run_data_generation(
     config: Config,
     monitor: PerformanceMonitor,
     benchmark: bool,
+    throttle_config: QueueThrottleConfig,
 ) -> Result<()> {
     let shared_worker_state = SharedWorkerState::new(&config);
 
@@ -355,9 +372,13 @@ async fn run_data_generation(
         let generator = RecordGenerator::new(config.objects);
         let insert_sql = insert_sql.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
-        let worker_state = shared_worker_state.clone(); // Clone for each worker
+        let worker_state = shared_worker_state.clone();
+        let throttle_us = tp_monitor.throttle_us.clone();
 
         let task = tokio::spawn(async move {
+            // Per-worker jitter seed based on worker_id
+            let jitter_factor = 0.8 + (worker_id as f64 % 10.0) * 0.04; // 0.80 to 1.16
+
             loop {
                 // Get current batch_size and batch_interval from shared state
                 let batch_size = worker_state.current_batch_size.load(Ordering::Relaxed);
@@ -438,6 +459,13 @@ async fn run_data_generation(
                             }
                         }
 
+                        // Queue-based throttle (read shared atomic, apply per-worker jitter)
+                        let throttle = throttle_us.load(Ordering::Relaxed);
+                        if throttle > 0 {
+                            let jittered = (throttle as f64 * jitter_factor) as u64;
+                            tokio::time::sleep(Duration::from_micros(jittered)).await;
+                        }
+
                         // Wait before next batch
                         if !batch_interval.is_zero() {
                             tokio::time::sleep(batch_interval).await;
@@ -451,7 +479,7 @@ async fn run_data_generation(
     }
 
     // Spawn thread pool poller (1s interval, collects active/queue per node)
-    let tp_poller = tp_monitor.spawn_poller(shutdown_tx.subscribe());
+    let tp_poller = tp_monitor.spawn_poller(shutdown_tx.subscribe(), throttle_config.clone());
 
     // Spawn reporting task (collects rate samples; logs only in non-benchmark mode)
     let monitor_clone = monitor.clone();
@@ -591,6 +619,10 @@ async fn run_data_generation(
                 "min_batch_interval": config.min_batch_interval,
                 "max_batch_interval": config.max_batch_interval,
                 "batch_interval_factor": config.batch_interval_factor,
+                "queue_throttle": throttle_config.enabled,
+                "queue_capacity": throttle_config.capacity,
+                "queue_throttle_pct": (throttle_config.threshold_pct * 100.0) as u64,
+                "queue_throttle_max_ms": throttle_config.max_throttle_us / 1000,
             },
             "results": {
                 "total_records": final_stats.total_records,
@@ -1205,7 +1237,13 @@ async fn main() -> Result<()> {
     let monitor = PerformanceMonitor::new();
 
     // Run data generation
-    run_data_generation(client, config, monitor, cli.benchmark).await?;
+    let throttle_config = QueueThrottleConfig {
+        enabled: cli.queue_throttle,
+        capacity: cli.queue_capacity,
+        threshold_pct: cli.queue_throttle_pct as f64 / 100.0,
+        max_throttle_us: cli.queue_throttle_max_ms * 1000, // ms to us
+    };
+    run_data_generation(client, config, monitor, cli.benchmark, throttle_config).await?;
 
     Ok(())
 }
