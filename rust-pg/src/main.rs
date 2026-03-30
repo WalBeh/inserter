@@ -292,12 +292,11 @@ fn find_write_pool(pools: &JsonValue) -> Option<&serde_json::Map<String, JsonVal
 /// Query thread_pools from sys.nodes. CrateDB returns ARRAY(OBJECT) as text
 /// over the PG wire protocol; we parse it as JSON.
 fn query_thread_pools_parsed(client: &mut Client) -> Vec<(String, JsonValue)> {
-    // CrateDB's ARRAY(OBJECT) may come as text or fail; try multiple approaches
     let sql = "SELECT name, thread_pools::text FROM sys.nodes ORDER BY name";
     let rows = match client.query(sql, &[]) {
         Ok(r) => r,
         Err(e) => {
-            tracing::debug!("thread_pools query failed: {}", e);
+            eprintln!("[tp-debug] query failed: {}", e);
             return Vec::new();
         }
     };
@@ -305,11 +304,17 @@ fn query_thread_pools_parsed(client: &mut Client) -> Vec<(String, JsonValue)> {
     rows.iter()
         .filter_map(|row| {
             let name: String = row.try_get(0).ok()?;
-            let text: String = row.try_get(1).ok()?;
+            let text: String = match row.try_get(1) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[tp-debug] try_get failed for {}: {}", name, e);
+                    return None;
+                }
+            };
             let pools: JsonValue = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::debug!("thread_pools parse failed for {}: {} (raw: {})", name, e, &text[..text.len().min(200)]);
+                    eprintln!("[tp-debug] JSON parse failed: {} (raw: {})", e, &text[..text.len().min(200)]);
                     return None;
                 }
             };
