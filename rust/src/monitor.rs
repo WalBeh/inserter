@@ -259,6 +259,15 @@ fn compute_percentiles(samples: &[f64]) -> PercentileStats {
 
 // ── Thread Pool Monitor ─────────────────────────────────────────────────────
 
+/// Find the "write" pool object from the thread_pools array column.
+fn find_write_pool(value: Option<&serde_json::Value>) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_object())
+        .find(|obj| obj.get("name").and_then(|n| n.as_str()) == Some("write"))
+}
+
 /// Per-node snapshot from a single poll of sys.nodes
 #[derive(Debug, Clone)]
 struct NodeSample {
@@ -331,14 +340,16 @@ impl ThreadPoolMonitor {
                     _ = shutdown_rx.recv() => break,
                     _ = interval.tick() => {
                         if let Ok(rows) = client.execute_query(
-                            "SELECT n.name, pool['active'], pool['queue'] FROM sys.nodes n, UNNEST(n.thread_pools) AS pool WHERE pool['name'] = 'write' ORDER BY n.name"
+                            "SELECT name, thread_pools FROM sys.nodes ORDER BY name"
                         ).await {
                             let mut smap = samples.write().await;
                             for row in &rows {
                                 let name = row.first().and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                                let active = row.get(1).and_then(|v| v.as_u64()).unwrap_or(0);
-                                let queue = row.get(2).and_then(|v| v.as_u64()).unwrap_or(0);
-                                smap.entry(name).or_default().push(NodeSample { active, queue });
+                                if let Some(pool) = find_write_pool(row.get(1)) {
+                                    let active = pool.get("active").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let queue = pool.get("queue").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    smap.entry(name).or_default().push(NodeSample { active, queue });
+                                }
                             }
                         }
                     }
@@ -349,16 +360,18 @@ impl ThreadPoolMonitor {
 
     async fn query_counters(&self) -> anyhow::Result<Vec<NodePoolCounters>> {
         let rows = self.client.execute_query(
-            "SELECT n.name, pool['threads'], pool['completed'], pool['rejected'] FROM sys.nodes n, UNNEST(n.thread_pools) AS pool WHERE pool['name'] = 'write' ORDER BY n.name"
+            "SELECT name, thread_pools FROM sys.nodes ORDER BY name"
         ).await?;
 
-        Ok(rows.iter().map(|row| {
-            NodePoolCounters {
-                name: row.first().and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                pool_size: row.get(1).and_then(|v| v.as_u64()).unwrap_or(0),
-                completed: row.get(2).and_then(|v| v.as_u64()).unwrap_or(0),
-                rejected: row.get(3).and_then(|v| v.as_u64()).unwrap_or(0),
-            }
+        Ok(rows.iter().filter_map(|row| {
+            let name = row.first().and_then(|v| v.as_str())?.to_string();
+            let pool = find_write_pool(row.get(1))?;
+            Some(NodePoolCounters {
+                name,
+                pool_size: pool.get("threads").and_then(|v| v.as_u64()).unwrap_or(0),
+                completed: pool.get("completed").and_then(|v| v.as_u64()).unwrap_or(0),
+                rejected: pool.get("rejected").and_then(|v| v.as_u64()).unwrap_or(0),
+            })
         }).collect())
     }
 
