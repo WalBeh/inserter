@@ -289,22 +289,39 @@ fn find_write_pool(pools: &JsonValue) -> Option<&serde_json::Map<String, JsonVal
         .find(|obj| obj.get("name").and_then(|n| n.as_str()) == Some("write"))
 }
 
-fn parse_thread_pools_column(row: &postgres::Row) -> Option<JsonValue> {
-    // CrateDB returns thread_pools as text over the PG wire protocol; parse it as JSON
-    let text: String = row.try_get(1).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-fn query_thread_pool_counters(client: &mut Client) -> Vec<NodePoolCounters> {
-    let rows = match client.query("SELECT name, thread_pools::text FROM sys.nodes ORDER BY name", &[]) {
+/// Query thread_pools from sys.nodes. CrateDB returns ARRAY(OBJECT) as text
+/// over the PG wire protocol; we parse it as JSON.
+fn query_thread_pools_parsed(client: &mut Client) -> Vec<(String, JsonValue)> {
+    // CrateDB's ARRAY(OBJECT) may come as text or fail; try multiple approaches
+    let sql = "SELECT name, thread_pools::text FROM sys.nodes ORDER BY name";
+    let rows = match client.query(sql, &[]) {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::debug!("thread_pools query failed: {}", e);
+            return Vec::new();
+        }
     };
 
     rows.iter()
         .filter_map(|row| {
             let name: String = row.try_get(0).ok()?;
-            let pools = parse_thread_pools_column(row)?;
+            let text: String = row.try_get(1).ok()?;
+            let pools: JsonValue = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("thread_pools parse failed for {}: {} (raw: {})", name, e, &text[..text.len().min(200)]);
+                    return None;
+                }
+            };
+            Some((name, pools))
+        })
+        .collect()
+}
+
+fn query_thread_pool_counters(client: &mut Client) -> Vec<NodePoolCounters> {
+    query_thread_pools_parsed(client)
+        .into_iter()
+        .filter_map(|(name, pools)| {
             let pool = find_write_pool(&pools)?;
             Some(NodePoolCounters {
                 name,
@@ -317,15 +334,9 @@ fn query_thread_pool_counters(client: &mut Client) -> Vec<NodePoolCounters> {
 }
 
 fn poll_thread_pool_samples(client: &mut Client) -> Vec<(String, NodeSample)> {
-    let rows = match client.query("SELECT name, thread_pools::text FROM sys.nodes ORDER BY name", &[]) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    rows.iter()
-        .filter_map(|row| {
-            let name: String = row.try_get(0).ok()?;
-            let pools = parse_thread_pools_column(row)?;
+    query_thread_pools_parsed(client)
+        .into_iter()
+        .filter_map(|(name, pools)| {
             let pool = find_write_pool(&pools)?;
             Some((name, NodeSample {
                 active: pool.get("active").and_then(|v| v.as_u64()).unwrap_or(0),
