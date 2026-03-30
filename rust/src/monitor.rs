@@ -419,12 +419,20 @@ impl ThreadPoolMonitor {
                                 let current = max_concurrency - extra_stolen;
 
                                 if desired < current {
-                                    // Steal permits by forgetting them
+                                    // Steal permits one at a time — workers hold most permits,
+                                    // so we grab each one as it becomes briefly available.
                                     let to_steal = current - desired;
-                                    // acquire_many will succeed because we have SEM_TOTAL permits total
-                                    if let Ok(permit) = sem.try_acquire_many(to_steal as u32) {
-                                        permit.forget();
-                                        extra_stolen += to_steal;
+                                    for _ in 0..to_steal {
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_millis(100),
+                                            sem.acquire(),
+                                        ).await {
+                                            Ok(Ok(permit)) => {
+                                                permit.forget();
+                                                extra_stolen += 1;
+                                            }
+                                            _ => break, // timeout or closed, try again next tick
+                                        }
                                     }
                                 } else if desired > current && extra_stolen > 0 {
                                     // Release permits back
