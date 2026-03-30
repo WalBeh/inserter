@@ -464,7 +464,7 @@ async fn run_data_generation(
     let num_threads = config.threads;
     let worker_state_clone = shared_worker_state.clone(); // Clone for reporting task
     let reporting_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut shutdown_rx = shutdown_tx_clone.subscribe();
 
         loop {

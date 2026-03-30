@@ -116,7 +116,10 @@ impl PerformanceMonitor {
 
         timing.last_report_time = now;
         timing.last_report_records = total_records;
-        timing.rate_samples.push(current_rate);
+        // Skip zero-rate samples (e.g. first tick before any batches complete)
+        if records_since_last > 0 {
+            timing.rate_samples.push(current_rate);
+        }
 
         PerformanceStats {
             total_records,
