@@ -148,13 +148,16 @@ impl BenchmarkMonitor {
         let now = Instant::now();
         let elapsed = now.duration_since(*last_time).as_secs_f64();
         let delta = total_rows.saturating_sub(*last_rows);
-        let rate = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
-        self.rate_samples
-            .lock()
-            .expect("rate_samples lock poisoned")
-            .push(rate);
         *last_rows = total_rows;
         *last_time = now;
+        // Skip zero-rate samples (e.g. first tick before any batches complete)
+        if delta > 0 {
+            let rate = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+            self.rate_samples
+                .lock()
+                .expect("rate_samples lock poisoned")
+                .push(rate);
+        }
     }
 
     fn final_stats(&self) -> JsonValue {
@@ -238,6 +241,162 @@ fn compute_percentiles(samples: &[f64]) -> PercentileStats {
         p90: (sorted[idx(0.90)] * 10.0).round() / 10.0,
         p95: (sorted[idx(0.95)] * 10.0).round() / 10.0,
     }
+}
+
+// ── Thread Pool Monitor (synchronous) ────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct NodeSample {
+    active: u64,
+    queue: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NodePoolCounters {
+    name: String,
+    pool_size: u64,
+    completed: u64,
+    rejected: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct NodeThreadPoolStats {
+    name: String,
+    pool_size: u64,
+    active: PercentileStats,
+    queued: PercentileStats,
+    completed_delta: u64,
+    rejected_delta: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterThreadPoolStats {
+    total_pool_size: u64,
+    total_completed: u64,
+    total_rejected: u64,
+    active_threads: PercentileStats,
+    queued_tasks: PercentileStats,
+    samples: usize,
+    nodes: Vec<NodeThreadPoolStats>,
+}
+
+/// Find the "write" pool from the thread_pools JSON array.
+fn find_write_pool(pools: &JsonValue) -> Option<&serde_json::Map<String, JsonValue>> {
+    pools
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_object())
+        .find(|obj| obj.get("name").and_then(|n| n.as_str()) == Some("write"))
+}
+
+fn parse_thread_pools_column(row: &postgres::Row) -> Option<JsonValue> {
+    // CrateDB returns thread_pools as text over the PG wire protocol; parse it as JSON
+    let text: String = row.try_get(1).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn query_thread_pool_counters(client: &mut Client) -> Vec<NodePoolCounters> {
+    let rows = match client.query("SELECT name, thread_pools::text FROM sys.nodes ORDER BY name", &[]) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    rows.iter()
+        .filter_map(|row| {
+            let name: String = row.try_get(0).ok()?;
+            let pools = parse_thread_pools_column(row)?;
+            let pool = find_write_pool(&pools)?;
+            Some(NodePoolCounters {
+                name,
+                pool_size: pool.get("threads").and_then(|v| v.as_u64()).unwrap_or(0),
+                completed: pool.get("completed").and_then(|v| v.as_u64()).unwrap_or(0),
+                rejected: pool.get("rejected").and_then(|v| v.as_u64()).unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+fn poll_thread_pool_samples(client: &mut Client) -> Vec<(String, NodeSample)> {
+    let rows = match client.query("SELECT name, thread_pools::text FROM sys.nodes ORDER BY name", &[]) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    rows.iter()
+        .filter_map(|row| {
+            let name: String = row.try_get(0).ok()?;
+            let pools = parse_thread_pools_column(row)?;
+            let pool = find_write_pool(&pools)?;
+            Some((name, NodeSample {
+                active: pool.get("active").and_then(|v| v.as_u64()).unwrap_or(0),
+                queue: pool.get("queue").and_then(|v| v.as_u64()).unwrap_or(0),
+            }))
+        })
+        .collect()
+}
+
+fn finalize_thread_pool_stats(
+    baseline: &[NodePoolCounters],
+    final_counters: &[NodePoolCounters],
+    samples: &std::collections::BTreeMap<String, Vec<NodeSample>>,
+) -> Option<ClusterThreadPoolStats> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let mut nodes = Vec::new();
+    let mut total_pool_size: u64 = 0;
+    let mut total_completed: u64 = 0;
+    let mut total_rejected: u64 = 0;
+    let mut num_samples: usize = 0;
+
+    for fc in final_counters {
+        let base = baseline.iter().find(|b| b.name == fc.name);
+        let completed_delta = fc.completed.saturating_sub(base.map(|b| b.completed).unwrap_or(0));
+        let rejected_delta = fc.rejected.saturating_sub(base.map(|b| b.rejected).unwrap_or(0));
+
+        total_pool_size += fc.pool_size;
+        total_completed += completed_delta;
+        total_rejected += rejected_delta;
+
+        let node_samples = samples.get(&fc.name);
+        let active_vals: Vec<f64> = node_samples
+            .map(|s| s.iter().map(|ns| ns.active as f64).collect())
+            .unwrap_or_default();
+        let queue_vals: Vec<f64> = node_samples
+            .map(|s| s.iter().map(|ns| ns.queue as f64).collect())
+            .unwrap_or_default();
+
+        if let Some(s) = node_samples {
+            num_samples = num_samples.max(s.len());
+        }
+
+        nodes.push(NodeThreadPoolStats {
+            name: fc.name.clone(),
+            pool_size: fc.pool_size,
+            active: compute_percentiles(&active_vals),
+            queued: compute_percentiles(&queue_vals),
+            completed_delta,
+            rejected_delta,
+        });
+    }
+
+    let cluster_active: Vec<f64> = (0..num_samples)
+        .map(|i| samples.values().filter_map(|v| v.get(i)).map(|s| s.active as f64).sum())
+        .collect();
+    let cluster_queue: Vec<f64> = (0..num_samples)
+        .map(|i| samples.values().filter_map(|v| v.get(i)).map(|s| s.queue as f64).sum())
+        .collect();
+
+    Some(ClusterThreadPoolStats {
+        total_pool_size,
+        total_completed,
+        total_rejected,
+        active_threads: compute_percentiles(&cluster_active),
+        queued_tasks: compute_percentiles(&cluster_queue),
+        samples: num_samples,
+        nodes,
+    })
 }
 
 fn quote_ident(ident: &str) -> String {
@@ -578,27 +737,40 @@ fn main() -> Result<()> {
 
     let cluster_info = query_cluster_info(&mut admin_client);
     let pre_count = query_single_i64(&mut admin_client, &format!("SELECT COUNT(*) FROM {}", quote_ident(&cli.table_name))).unwrap_or(0).max(0) as u64;
-    let pre_rejected = query_single_i64(
-        &mut admin_client,
-        "SELECT SUM(pool['rejected'])::bigint FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'",
-    )
-    .unwrap_or(0)
-    .max(0) as u64;
+    let tp_baseline = query_thread_pool_counters(&mut admin_client);
 
     let mut handles = Vec::with_capacity(cli.threads);
     let stop = Arc::new(AtomicBool::new(false));
     let monitor_for_reporter = Arc::clone(&monitor);
     let stop_for_reporter = Arc::clone(&stop);
+    let conn_str_for_reporter = cli.connection_string.clone();
 
     let reporter = if cli.benchmark {
         Some(thread::spawn(move || {
+            let mut tp_samples: std::collections::BTreeMap<String, Vec<NodeSample>> =
+                std::collections::BTreeMap::new();
+            // Open a separate connection for polling
+            let mut poll_client = connect(&conn_str_for_reporter).ok();
+
             while !stop_for_reporter.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_secs(10));
+                thread::sleep(Duration::from_secs(1));
                 if stop_for_reporter.load(Ordering::Relaxed) {
                     break;
                 }
-                monitor_for_reporter.sample_rate();
+                // Sample rate every 5 ticks (5s), poll thread pool every tick (1s)
+                static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let tick = TICK.fetch_add(1, Ordering::Relaxed);
+                if tick % 5 == 4 {
+                    monitor_for_reporter.sample_rate();
+                }
+                if let Some(ref mut client) = poll_client {
+                    for (name, sample) in poll_thread_pool_samples(client) {
+                        tp_samples.entry(name).or_default().push(sample);
+                    }
+                }
             }
+
+            tp_samples
         }))
     } else {
         None
@@ -631,32 +803,43 @@ fn main() -> Result<()> {
 
     stop.store(true, Ordering::Relaxed);
     monitor.sample_rate();
-    if let Some(reporter) = reporter {
-        let _ = reporter.join();
-    }
+    let tp_samples = if let Some(reporter) = reporter {
+        reporter.join().ok()
+    } else {
+        None
+    };
 
     let elapsed = start.elapsed().as_secs_f64();
     let rows = monitor.total_rows.load(Ordering::Relaxed);
     let err_count = monitor.total_errors.load(Ordering::Relaxed);
     let rps = if elapsed > 0.0 { rows as f64 / elapsed } else { 0.0 };
 
+    // Finalize thread pool stats
+    let tp_final = query_thread_pool_counters(&mut admin_client);
+    let thread_pool_stats = tp_samples
+        .as_ref()
+        .and_then(|samples| finalize_thread_pool_stats(&tp_baseline, &tp_final, samples));
+    let rejected_writes = thread_pool_stats
+        .as_ref()
+        .map(|tp| tp.total_rejected)
+        .unwrap_or(0);
+
     let _ = admin_client.batch_execute(&format!("REFRESH TABLE {}", quote_ident(&cli.table_name)));
     let verified_count = query_single_i64(&mut admin_client, &format!("SELECT COUNT(*) FROM {}", quote_ident(&cli.table_name))).unwrap_or(0).max(0) as u64;
-    let rejected_writes = query_single_i64(
-        &mut admin_client,
-        "SELECT SUM(pool['rejected'])::bigint FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'",
-    )
-    .unwrap_or(0)
-    .max(0) as u64;
 
     if cli.benchmark {
+        let mut cluster_with_tp = cluster_info.clone();
+        if let Some(ref tp) = thread_pool_stats {
+            cluster_with_tp["write_thread_pool"] = json!(tp);
+        }
+
         let report = build_report(
-            cluster_info,
+            cluster_with_tp,
             &cli.table_name,
             &cli,
             &monitor,
             verified_count.saturating_sub(pre_count),
-            rejected_writes.saturating_sub(pre_rejected),
+            rejected_writes,
         );
         println!("{}", serde_json::to_string(&report).unwrap());
 
@@ -680,15 +863,16 @@ fn main() -> Result<()> {
         let avg = per_cpu.get("avg").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let p95 = per_cpu.get("p95").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let max = per_cpu.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let rej_str = if rejected_writes > pre_rejected {
-            let rej_pct = if rows > 0 { ((rejected_writes - pre_rejected) as f64 / rows as f64) * 100.0 } else { 0.0 };
-            format!(" | REJECTED: {} ({:.1}%)", rejected_writes - pre_rejected, rej_pct)
+        let effective_rec_per_cpu = (rows as f64 / elapsed / total_cpus as f64).round();
+        let rej_str = if rejected_writes > 0 {
+            let rej_pct = if rows > 0 { (rejected_writes as f64 / rows as f64) * 100.0 } else { 0.0 };
+            format!(" | REJECTED: {} ({:.1}%)", rejected_writes, rej_pct)
         } else {
             String::new()
         };
         eprintln!(
-            "CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0}{}",
-            version, total_cpus, rate_stats.p90, avg, p95, max, rej_str
+            "CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0} | effective rec/cpu/s={:.0}{}",
+            version, total_cpus, rate_stats.p90, avg, p95, max, effective_rec_per_cpu, rej_str
         );
     } else {
         info!("inserted {rows} rows in {elapsed:.2}s ({rps:.0} rows/sec), errors={err_count}");
