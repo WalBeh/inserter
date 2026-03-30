@@ -137,9 +137,6 @@ struct Cli {
     #[arg(long, default_value_t = 50)]
     queue_throttle_pct: u64,
 
-    /// Maximum throttle sleep in milliseconds (default: 100)
-    #[arg(long, default_value_t = 100)]
-    queue_throttle_max_ms: u64,
 }
 
 fn sanitize_connection_string(connection_string: &str) -> String {
@@ -310,7 +307,7 @@ async fn run_data_generation(
     let cluster_info = query_cluster_info(&client).await;
 
     // Create thread pool monitor and capture baseline counters
-    let tp_monitor = ThreadPoolMonitor::new(client.clone());
+    let tp_monitor = ThreadPoolMonitor::new(client.clone(), config.threads);
     tp_monitor.capture_baseline().await;
 
     // Get pre-existing record count and rejected writes baseline
@@ -373,12 +370,10 @@ async fn run_data_generation(
         let insert_sql = insert_sql.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let worker_state = shared_worker_state.clone();
-        let throttle_us = tp_monitor.throttle_us.clone();
+        let concurrency_sem = tp_monitor.concurrency_sem.clone();
+        let throttle_enabled = throttle_config.enabled;
 
         let task = tokio::spawn(async move {
-            // Per-worker jitter seed based on worker_id
-            let jitter_factor = 0.8 + (worker_id as f64 % 10.0) * 0.04; // 0.80 to 1.16
-
             loop {
                 // Get current batch_size and batch_interval from shared state
                 let batch_size = worker_state.current_batch_size.load(Ordering::Relaxed);
@@ -401,6 +396,13 @@ async fn run_data_generation(
                                 .collect::<Vec<Vec<serde_json::Value>>>()
                         }).await.expect("batch generation panicked");
 
+                        // Acquire concurrency permit (blocks if throttle has reduced permits)
+                        let _permit = if throttle_enabled {
+                            Some(concurrency_sem.acquire().await.expect("semaphore closed"))
+                        } else {
+                            None
+                        };
+
                         // Insert batch
                         let (success, latency_ms) = match client.execute_bulk(&insert_sql, params).await {
                             Ok((bytes_sent, latency)) => {
@@ -411,9 +413,11 @@ async fn run_data_generation(
                             Err(e) => {
                                 error!("Worker {} error: {}", worker_id, e);
                                 monitor.add_error();
-                                (false, -1.0) // Indicate error with negative latency or handle differently
+                                (false, -1.0)
                             }
                         };
+
+                        drop(_permit); // release permit after response
 
                         // Adaptive batching logic
                         if worker_state.adaptive_batching_enabled {
@@ -457,13 +461,6 @@ async fn run_data_generation(
                                 worker_state.current_batch_interval.store(new_interval, Ordering::Relaxed);
                                 debug!("Worker {} (error) increased batch_interval to {}ms", worker_id, new_interval);
                             }
-                        }
-
-                        // Queue-based throttle (read shared atomic, apply per-worker jitter)
-                        let throttle = throttle_us.load(Ordering::Relaxed);
-                        if throttle > 0 {
-                            let jittered = (throttle as f64 * jitter_factor) as u64;
-                            tokio::time::sleep(Duration::from_micros(jittered)).await;
                         }
 
                         // Wait before next batch
@@ -622,7 +619,6 @@ async fn run_data_generation(
                 "queue_throttle": throttle_config.enabled,
                 "queue_capacity": throttle_config.capacity,
                 "queue_throttle_pct": (throttle_config.threshold_pct * 100.0) as u64,
-                "queue_throttle_max_ms": throttle_config.max_throttle_us / 1000,
             },
             "results": {
                 "total_records": final_stats.total_records,
@@ -639,6 +635,7 @@ async fn run_data_generation(
                 "rejected_pct": (rejected_writes as f64 / final_stats.total_records.max(1) as f64 * 100.0 * 100.0).round() / 100.0,
                 "average_batch_size": monitor.get_average_batch_size(),
                 "error_rate_pct": (monitor.get_error_rate().await * 10.0).round() / 10.0,
+                "final_concurrency": tp_monitor.current_concurrency.load(Ordering::Relaxed),
             }
         });
         println!("{}", serde_json::to_string(&result).unwrap());
@@ -1241,7 +1238,6 @@ async fn main() -> Result<()> {
         enabled: cli.queue_throttle,
         capacity: cli.queue_capacity,
         threshold_pct: cli.queue_throttle_pct as f64 / 100.0,
-        max_throttle_us: cli.queue_throttle_max_ms * 1000, // ms to us
     };
     run_data_generation(client, config, monitor, cli.benchmark, throttle_config).await?;
 
