@@ -6,7 +6,7 @@ use postgres::{Client, NoTls, Statement};
 use postgres_native_tls::MakeTlsConnector;
 use serde_json::{json, Map, Value as JsonValue};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,6 +70,18 @@ struct Cli {
     /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Enable queue-based throttling (adjusts concurrency based on write queue depth)
+    #[arg(long)]
+    queue_throttle: bool,
+
+    /// Write thread pool queue capacity (default: 200, matches CrateDB default)
+    #[arg(long, default_value_t = 200)]
+    queue_capacity: u64,
+
+    /// Queue fill percentage at which throttling starts (default: 50)
+    #[arg(long, default_value_t = 50)]
+    queue_throttle_pct: u64,
 }
 
 #[derive(Clone)]
@@ -449,6 +461,61 @@ fn finalize_thread_pool_stats(
     })
 }
 
+// ── Concurrency Limiter (std::sync, for use with std::thread workers) ────────
+
+/// A counting semaphore that the reporter thread can adjust at runtime.
+/// Workers call acquire() before sending a request and release() after.
+/// The reporter calls set_max() to raise or lower the limit.
+struct ConcurrencyLimiter {
+    state: Mutex<ConcurrencyState>,
+    cond: Condvar,
+}
+
+struct ConcurrencyState {
+    max: usize,
+    active: usize,
+}
+
+impl ConcurrencyLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            state: Mutex::new(ConcurrencyState { max, active: 0 }),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Block until a slot is available, then increment active count.
+    fn acquire(&self) {
+        let mut state = self.state.lock().unwrap();
+        while state.active >= state.max {
+            state = self.cond.wait(state).unwrap();
+        }
+        state.active += 1;
+    }
+
+    /// Release a slot and wake one waiting worker.
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.active -= 1;
+        self.cond.notify_one();
+    }
+
+    /// Adjust the concurrency limit. If increased, wake blocked workers.
+    fn set_max(&self, new_max: usize) {
+        let mut state = self.state.lock().unwrap();
+        let old_max = state.max;
+        state.max = new_max;
+        if new_max > old_max {
+            // Wake workers that might now be able to proceed
+            self.cond.notify_all();
+        }
+    }
+
+    fn current_max(&self) -> usize {
+        self.state.lock().unwrap().max
+    }
+}
+
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
@@ -690,6 +757,7 @@ fn build_report(
     monitor: &BenchmarkMonitor,
     verified_count: u64,
     rejected_writes: u64,
+    final_concurrency: usize,
 ) -> JsonValue {
     let rate_stats = monitor.rate_stats();
     let latency_stats = monitor.latency_stats();
@@ -722,6 +790,9 @@ fn build_report(
             "table_name": table_name,
             "shards": cli.shards,
             "replicas": cli.replicas,
+            "queue_throttle": cli.queue_throttle,
+            "queue_capacity": cli.queue_capacity,
+            "queue_throttle_pct": cli.queue_throttle_pct,
         },
         "results": {
             "total_records": final_stats.get("total_records").cloned().unwrap_or(json!(0)),
@@ -740,6 +811,7 @@ fn build_report(
             } else { 0.0 },
             "average_batch_size": monitor.average_batch_size(),
             "error_rate_pct": (monitor.error_rate_pct() * 10.0).round() / 10.0,
+            "final_concurrency": final_concurrency,
         }
     })
 }
@@ -790,11 +862,20 @@ fn main() -> Result<()> {
     let http_url = pg_to_http_url(&cli.connection_string);
     let tp_baseline = query_thread_pool_counters(&http_url);
 
+    // Concurrency limiter
+    let limiter = Arc::new(ConcurrencyLimiter::new(cli.threads));
+    let throttle_enabled = cli.queue_throttle;
+    let queue_capacity = cli.queue_capacity as f64;
+    let threshold_pct = cli.queue_throttle_pct as f64 / 100.0;
+    let max_concurrency = cli.threads;
+    let min_concurrency = (max_concurrency as f64 * 0.25).ceil() as usize;
+
     let mut handles = Vec::with_capacity(cli.threads);
     let stop = Arc::new(AtomicBool::new(false));
     let monitor_for_reporter = Arc::clone(&monitor);
     let stop_for_reporter = Arc::clone(&stop);
     let http_url_for_reporter = http_url.clone();
+    let limiter_for_reporter = Arc::clone(&limiter);
 
     let reporter = if cli.benchmark {
         Some(thread::spawn(move || {
@@ -812,8 +893,33 @@ fn main() -> Result<()> {
                 if tick % 5 == 4 {
                     monitor_for_reporter.sample_rate();
                 }
-                for (name, sample) in poll_thread_pool_samples(&http_url_for_reporter) {
-                    tp_samples.entry(name).or_default().push(sample);
+
+                let polled = poll_thread_pool_samples(&http_url_for_reporter);
+                let mut total_queue: u64 = 0;
+                let mut node_count: u64 = 0;
+                for (name, sample) in &polled {
+                    total_queue += sample.queue;
+                    node_count += 1;
+                    tp_samples.entry(name.clone()).or_default().push(sample.clone());
+                }
+
+                // Adjust concurrency based on queue depth
+                if throttle_enabled && node_count > 0 {
+                    let avg_queue = total_queue as f64 / node_count as f64;
+                    let queue_pct = avg_queue / queue_capacity;
+
+                    let desired = if queue_pct > threshold_pct {
+                        let pressure = (queue_pct - threshold_pct) / (1.0 - threshold_pct);
+                        let target = max_concurrency as f64 - pressure * (max_concurrency - min_concurrency) as f64;
+                        (target as usize).max(min_concurrency)
+                    } else if queue_pct < threshold_pct * 0.5 {
+                        // Well below threshold: restore 1 per tick
+                        (limiter_for_reporter.current_max() + 1).min(max_concurrency)
+                    } else {
+                        limiter_for_reporter.current_max()
+                    };
+
+                    limiter_for_reporter.set_max(desired);
                 }
             }
 
@@ -825,19 +931,17 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
     for worker_id in 0..cli.threads {
-        let args = (
-            worker_id,
-            cli.connection_string.clone(),
-            cli.table_name.clone(),
-            cli.objects,
-            cli.batch_size,
-            interval,
-            deadline,
-            Arc::clone(&monitor),
-            Arc::clone(&stop),
-        );
+        let conn_str = cli.connection_string.clone();
+        let table = cli.table_name.clone();
+        let objects = cli.objects;
+        let batch_size = cli.batch_size;
+        let mon = Arc::clone(&monitor);
+        let stp = Arc::clone(&stop);
+        let lim = Arc::clone(&limiter);
+        let thr = throttle_enabled;
+
         handles.push(thread::spawn(move || worker(
-            args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8,
+            worker_id, conn_str, table, objects, batch_size, interval, deadline, mon, stp, lim, thr,
         )));
     }
 
@@ -887,6 +991,7 @@ fn main() -> Result<()> {
             &monitor,
             verified_count.saturating_sub(pre_count),
             rejected_writes,
+            limiter.current_max(),
         );
         println!("{}", serde_json::to_string(&report).unwrap());
 
@@ -945,6 +1050,8 @@ fn worker(
     deadline: Instant,
     monitor: Arc<BenchmarkMonitor>,
     stop: Arc<AtomicBool>,
+    limiter: Arc<ConcurrencyLimiter>,
+    throttle_enabled: bool,
 ) {
     let mut client = match connect(&connection_string) {
         Ok(client) => client,
@@ -975,6 +1082,10 @@ fn worker(
             .map(record_to_pg)
             .collect();
 
+        if throttle_enabled {
+            limiter.acquire();
+        }
+
         match execute_batch(&mut client, &stmt, &records, object_count) {
             Ok((inserted, latency_ms)) => {
                 monitor.add_batch(inserted as usize, latency_ms);
@@ -983,6 +1094,10 @@ fn worker(
                 tracing::error!("Worker {worker_id} error: {err:#}");
                 monitor.add_error();
             }
+        }
+
+        if throttle_enabled {
+            limiter.release();
         }
 
         if !interval.is_zero() {
