@@ -291,75 +291,98 @@ fn find_write_pool(pools: &JsonValue) -> Option<&serde_json::Map<String, JsonVal
 
 /// Query thread_pools from sys.nodes. CrateDB returns ARRAY(OBJECT) as text
 /// over the PG wire protocol; we parse it as JSON.
-/// Thread pool data queried via scalar fields (avoids ARRAY(OBJECT) casting issues over PG wire).
-struct ThreadPoolRow {
-    node_name: String,
-    active: i64,
-    queue: i64,
-    threads: i64,
-    completed: i64,
-    rejected: i64,
-}
+/// Query thread_pools via CrateDB's HTTP /_sql endpoint since the PG wire
+/// protocol cannot serialize OBJECT/ARRAY(OBJECT) types from sys.nodes.
+fn query_thread_pools_http(http_url: &str) -> Vec<(String, JsonValue)> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
 
-fn query_thread_pool_rows(client: &mut Client) -> Vec<ThreadPoolRow> {
-    // Query each write-pool field individually using array_agg + filter workaround.
-    // CrateDB doesn't support UNNEST in FROM over PG wire, so use a scalar approach:
-    // the thread_pools column has a known structure, query via subscript on unnested subselect.
-    let sql = r#"
-        SELECT
-            x.name,
-            x.pool['active']::bigint,
-            x.pool['queue']::bigint,
-            x.pool['threads']::bigint,
-            x.pool['completed']::bigint,
-            x.pool['rejected']::bigint
-        FROM (
-            SELECT name, UNNEST(thread_pools) AS pool FROM sys.nodes
-        ) x
-        WHERE x.pool['name'] = 'write'
-        ORDER BY x.name
-    "#;
-    match client.query(sql, &[]) {
-        Ok(rows) => rows
-            .iter()
-            .filter_map(|row| {
-                Some(ThreadPoolRow {
-                    node_name: row.try_get(0).ok()?,
-                    active: row.try_get(1).ok()?,
-                    queue: row.try_get(2).ok()?,
-                    threads: row.try_get(3).ok()?,
-                    completed: row.try_get(4).ok()?,
-                    rejected: row.try_get(5).ok()?,
-                })
-            })
-            .collect(),
-        Err(e) => {
-            eprintln!("[tp-debug] thread pool query failed: {}", e);
-            Vec::new()
-        }
+    let url = match Url::parse(http_url) {
+        Ok(u) => u,
+        Err(_) => return Vec::new(),
+    };
+    let host = url.host_str().unwrap_or("localhost");
+    let port = url.port().unwrap_or(4200);
+    let body = r#"{"stmt":"SELECT name, thread_pools FROM sys.nodes ORDER BY name"}"#;
+
+    let mut stream = match TcpStream::connect((host, port)) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+    let request = format!(
+        "POST /_sql HTTP/1.0\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        host, port, body.len(), body
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return Vec::new();
     }
+
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+
+    // Split HTTP headers from body
+    let json_body = match text.find("\r\n\r\n") {
+        Some(pos) => &text[pos + 4..],
+        None => return Vec::new(),
+    };
+
+    let parsed: JsonValue = match serde_json::from_str(json_body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    parsed
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let name = row.get(0)?.as_str()?.to_string();
+                    let pools = row.get(1)?.clone();
+                    Some((name, pools))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-fn query_thread_pool_counters(client: &mut Client) -> Vec<NodePoolCounters> {
-    query_thread_pool_rows(client)
+fn query_thread_pool_counters(http_url: &str) -> Vec<NodePoolCounters> {
+    query_thread_pools_http(http_url)
         .into_iter()
-        .map(|r| NodePoolCounters {
-            name: r.node_name,
-            pool_size: r.threads.max(0) as u64,
-            completed: r.completed.max(0) as u64,
-            rejected: r.rejected.max(0) as u64,
+        .filter_map(|(name, pools)| {
+            let pool = find_write_pool(&pools)?;
+            Some(NodePoolCounters {
+                name,
+                pool_size: pool.get("threads").and_then(|v| v.as_u64()).unwrap_or(0),
+                completed: pool.get("completed").and_then(|v| v.as_u64()).unwrap_or(0),
+                rejected: pool.get("rejected").and_then(|v| v.as_u64()).unwrap_or(0),
+            })
         })
         .collect()
 }
 
-fn poll_thread_pool_samples(client: &mut Client) -> Vec<(String, NodeSample)> {
-    query_thread_pool_rows(client)
+fn poll_thread_pool_samples(http_url: &str) -> Vec<(String, NodeSample)> {
+    query_thread_pools_http(http_url)
         .into_iter()
-        .map(|r| (r.node_name, NodeSample {
-            active: r.active.max(0) as u64,
-            queue: r.queue.max(0) as u64,
-        }))
+        .filter_map(|(name, pools)| {
+            let pool = find_write_pool(&pools)?;
+            Some((name, NodeSample {
+                active: pool.get("active").and_then(|v| v.as_u64()).unwrap_or(0),
+                queue: pool.get("queue").and_then(|v| v.as_u64()).unwrap_or(0),
+            }))
+        })
         .collect()
+}
+
+/// Derive the HTTP base URL from a PG connection string (same host, port 4200).
+fn pg_to_http_url(connection_string: &str) -> String {
+    match Url::parse(connection_string) {
+        Ok(url) => format!("http://{}:{}", url.host_str().unwrap_or("localhost"), 4200),
+        Err(_) => "http://localhost:4200".to_string(),
+    }
 }
 
 fn finalize_thread_pool_stats(
@@ -764,20 +787,19 @@ fn main() -> Result<()> {
 
     let cluster_info = query_cluster_info(&mut admin_client);
     let pre_count = query_single_i64(&mut admin_client, &format!("SELECT COUNT(*) FROM {}", quote_ident(&cli.table_name))).unwrap_or(0).max(0) as u64;
-    let tp_baseline = query_thread_pool_counters(&mut admin_client);
+    let http_url = pg_to_http_url(&cli.connection_string);
+    let tp_baseline = query_thread_pool_counters(&http_url);
 
     let mut handles = Vec::with_capacity(cli.threads);
     let stop = Arc::new(AtomicBool::new(false));
     let monitor_for_reporter = Arc::clone(&monitor);
     let stop_for_reporter = Arc::clone(&stop);
-    let conn_str_for_reporter = cli.connection_string.clone();
+    let http_url_for_reporter = http_url.clone();
 
     let reporter = if cli.benchmark {
         Some(thread::spawn(move || {
             let mut tp_samples: std::collections::BTreeMap<String, Vec<NodeSample>> =
                 std::collections::BTreeMap::new();
-            // Open a separate connection for polling
-            let mut poll_client = connect(&conn_str_for_reporter).ok();
 
             while !stop_for_reporter.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_secs(1));
@@ -790,10 +812,8 @@ fn main() -> Result<()> {
                 if tick % 5 == 4 {
                     monitor_for_reporter.sample_rate();
                 }
-                if let Some(ref mut client) = poll_client {
-                    for (name, sample) in poll_thread_pool_samples(client) {
-                        tp_samples.entry(name).or_default().push(sample);
-                    }
+                for (name, sample) in poll_thread_pool_samples(&http_url_for_reporter) {
+                    tp_samples.entry(name).or_default().push(sample);
                 }
             }
 
@@ -842,7 +862,7 @@ fn main() -> Result<()> {
     let rps = if elapsed > 0.0 { rows as f64 / elapsed } else { 0.0 };
 
     // Finalize thread pool stats
-    let tp_final = query_thread_pool_counters(&mut admin_client);
+    let tp_final = query_thread_pool_counters(&http_url);
     let thread_pool_stats = tp_samples
         .as_ref()
         .and_then(|samples| finalize_thread_pool_stats(&tp_baseline, &tp_final, samples));
