@@ -1,8 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
+
+use crate::client::CrateClient;
 
 #[derive(Debug, Clone)]
 pub struct PerformanceStats {
@@ -175,12 +178,12 @@ impl PerformanceMonitor {
 
     pub async fn get_percentile_stats(&self) -> PercentileStats {
         let timing = self.timing.read().await;
-        Self::compute_percentiles(&timing.rate_samples)
+        compute_percentiles(&timing.rate_samples)
     }
 
     pub async fn get_latency_stats(&self) -> PercentileStats {
         let timing = self.timing.read().await;
-        Self::compute_percentiles(&timing.latency_samples)
+        compute_percentiles(&timing.latency_samples)
     }
 
     pub async fn get_bandwidth_mbps(&self) -> f64 {
@@ -198,29 +201,6 @@ impl PerformanceMonitor {
 
     pub fn get_total_bytes_sent(&self) -> u64 {
         self.counters.total_bytes_sent.load(Ordering::Relaxed)
-    }
-
-    fn compute_percentiles(samples: &[f64]) -> PercentileStats {
-        if samples.is_empty() {
-            return PercentileStats {
-                avg: 0.0,
-                min: 0.0,
-                max: 0.0,
-                p90: 0.0,
-                p95: 0.0,
-            };
-        }
-        let mut sorted: Vec<f64> = samples.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = sorted.len();
-        let avg = sorted.iter().sum::<f64>() / n as f64;
-        PercentileStats {
-            avg: (avg * 10.0).round() / 10.0,
-            min: (sorted[0] * 10.0).round() / 10.0,
-            max: (sorted[n - 1] * 10.0).round() / 10.0,
-            p90: (sorted[(n as f64 * 0.9) as usize] * 10.0).round() / 10.0,
-            p95: (sorted[(n as f64 * 0.95) as usize] * 10.0).round() / 10.0,
-        }
     }
 
     pub fn get_total_records(&self) -> u64 {
@@ -254,10 +234,30 @@ impl Default for PerformanceMonitor {
     }
 }
 
-// ── Thread Pool Monitor ─────────────────────────────────────────────────────
+fn compute_percentiles(samples: &[f64]) -> PercentileStats {
+    if samples.is_empty() {
+        return PercentileStats {
+            avg: 0.0,
+            min: 0.0,
+            max: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+        };
+    }
+    let mut sorted: Vec<f64> = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = sorted.len();
+    let avg = sorted.iter().sum::<f64>() / n as f64;
+    PercentileStats {
+        avg: (avg * 10.0).round() / 10.0,
+        min: (sorted[0] * 10.0).round() / 10.0,
+        max: (sorted[n - 1] * 10.0).round() / 10.0,
+        p90: (sorted[(n as f64 * 0.9) as usize] * 10.0).round() / 10.0,
+        p95: (sorted[(n as f64 * 0.95) as usize] * 10.0).round() / 10.0,
+    }
+}
 
-use crate::client::CrateClient;
-use tokio::sync::broadcast;
+// ── Thread Pool Monitor ─────────────────────────────────────────────────────
 
 /// Per-node snapshot from a single poll of sys.nodes
 #[derive(Debug, Clone)]
@@ -266,16 +266,14 @@ struct NodeSample {
     queue: u64,
 }
 
-/// Per-node baseline/final counters (for delta computation)
 #[derive(Debug, Clone)]
-pub struct NodePoolCounters {
-    pub name: String,
-    pub pool_size: u64,
-    pub completed: u64,
-    pub rejected: u64,
+struct NodePoolCounters {
+    name: String,
+    pool_size: u64,
+    completed: u64,
+    rejected: u64,
 }
 
-/// Final per-node stats after the benchmark
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeThreadPoolStats {
     pub name: String,
@@ -286,7 +284,6 @@ pub struct NodeThreadPoolStats {
     pub rejected_delta: u64,
 }
 
-/// Cluster-aggregate thread pool stats
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ClusterThreadPoolStats {
     pub total_pool_size: u64,
@@ -301,10 +298,7 @@ pub struct ClusterThreadPoolStats {
 /// Monitors CrateDB write thread pool by polling sys.nodes during the benchmark.
 pub struct ThreadPoolMonitor {
     client: CrateClient,
-    /// node_name -> Vec<NodeSample> collected each poll
     samples: Arc<RwLock<std::collections::BTreeMap<String, Vec<NodeSample>>>>,
-    /// cluster-aggregate samples (sum of active/queue across all nodes per poll)
-    cluster_samples: Arc<RwLock<Vec<NodeSample>>>,
     baseline: Arc<RwLock<Vec<NodePoolCounters>>>,
 }
 
@@ -313,26 +307,22 @@ impl ThreadPoolMonitor {
         Self {
             client,
             samples: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
-            cluster_samples: Arc::new(RwLock::new(Vec::new())),
             baseline: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    /// Capture baseline counters (completed/rejected) before the benchmark starts.
     pub async fn capture_baseline(&self) {
         if let Ok(counters) = self.query_counters().await {
             *self.baseline.write().await = counters;
         }
     }
 
-    /// Spawn the polling loop. Returns a JoinHandle; send on shutdown_tx to stop.
     pub fn spawn_poller(
         &self,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let samples = self.samples.clone();
-        let cluster_samples = self.cluster_samples.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -343,23 +333,13 @@ impl ThreadPoolMonitor {
                         if let Ok(rows) = client.execute_query(
                             "SELECT name, thread_pools['write']['active'], thread_pools['write']['queue'] FROM sys.nodes ORDER BY name"
                         ).await {
-                            let mut total_active: u64 = 0;
-                            let mut total_queue: u64 = 0;
                             let mut smap = samples.write().await;
-                            let mut csamples = cluster_samples.write().await;
-
                             for row in &rows {
                                 let name = row.first().and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
                                 let active = row.get(1).and_then(|v| v.as_u64()).unwrap_or(0);
                                 let queue = row.get(2).and_then(|v| v.as_u64()).unwrap_or(0);
-
-                                total_active += active;
-                                total_queue += queue;
-
                                 smap.entry(name).or_default().push(NodeSample { active, queue });
                             }
-
-                            csamples.push(NodeSample { active: total_active, queue: total_queue });
                         }
                     }
                 }
@@ -367,7 +347,6 @@ impl ThreadPoolMonitor {
         })
     }
 
-    /// Query current counters from sys.nodes
     async fn query_counters(&self) -> anyhow::Result<Vec<NodePoolCounters>> {
         let rows = self.client.execute_query(
             "SELECT name, thread_pools['write']['threads'], thread_pools['write']['completed'], thread_pools['write']['rejected'] FROM sys.nodes ORDER BY name"
@@ -383,22 +362,22 @@ impl ThreadPoolMonitor {
         }).collect())
     }
 
-    /// Compute final stats after the benchmark. Call after the poller has stopped.
+    /// Call after the poller has stopped.
     pub async fn finalize(&self) -> Option<ClusterThreadPoolStats> {
-        let baseline = self.baseline.read().await;
+        // Read and release baseline before the network call
+        let baseline = self.baseline.read().await.clone();
         let final_counters = self.query_counters().await.ok()?;
         let samples = self.samples.read().await;
-        let cluster_samples = self.cluster_samples.read().await;
 
-        if cluster_samples.is_empty() {
+        if samples.is_empty() {
             return None;
         }
 
-        // Build per-node stats
         let mut nodes = Vec::new();
         let mut total_pool_size: u64 = 0;
         let mut total_completed: u64 = 0;
         let mut total_rejected: u64 = 0;
+        let mut num_samples: usize = 0;
 
         for fc in &final_counters {
             let base = baseline.iter().find(|b| b.name == fc.name);
@@ -417,27 +396,38 @@ impl ThreadPoolMonitor {
                 .map(|s| s.iter().map(|ns| ns.queue as f64).collect())
                 .unwrap_or_default();
 
+            if let Some(s) = node_samples {
+                num_samples = num_samples.max(s.len());
+            }
+
             nodes.push(NodeThreadPoolStats {
                 name: fc.name.clone(),
                 pool_size: fc.pool_size,
-                active: PerformanceMonitor::compute_percentiles(&active_vals),
-                queued: PerformanceMonitor::compute_percentiles(&queue_vals),
+                active: compute_percentiles(&active_vals),
+                queued: compute_percentiles(&queue_vals),
                 completed_delta,
                 rejected_delta,
             });
         }
 
-        // Cluster-aggregate stats
-        let cluster_active: Vec<f64> = cluster_samples.iter().map(|s| s.active as f64).collect();
-        let cluster_queue: Vec<f64> = cluster_samples.iter().map(|s| s.queue as f64).collect();
-        let num_samples = cluster_samples.len();
+        // Compute cluster-aggregate from per-node samples
+        let cluster_active: Vec<f64> = (0..num_samples)
+            .map(|i| {
+                samples.values().filter_map(|v| v.get(i)).map(|s| s.active as f64).sum()
+            })
+            .collect();
+        let cluster_queue: Vec<f64> = (0..num_samples)
+            .map(|i| {
+                samples.values().filter_map(|v| v.get(i)).map(|s| s.queue as f64).sum()
+            })
+            .collect();
 
         Some(ClusterThreadPoolStats {
             total_pool_size,
             total_completed,
             total_rejected,
-            active_threads: PerformanceMonitor::compute_percentiles(&cluster_active),
-            queued_tasks: PerformanceMonitor::compute_percentiles(&cluster_queue),
+            active_threads: compute_percentiles(&cluster_active),
+            queued_tasks: compute_percentiles(&cluster_queue),
             samples: num_samples,
             nodes,
         })

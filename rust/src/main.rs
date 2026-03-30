@@ -311,10 +311,6 @@ async fn run_data_generation(
             })
             .unwrap_or(0)
     };
-    let pre_rejected = client.execute_query(
-        "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
-    ).await.ok().and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64()))).unwrap_or(0);
-
     // Prepare insert statement
     let mut placeholders = vec!["?"; 10]; // Base fields
     placeholders.extend(vec!["?"; config.objects]); // Object fields
@@ -542,11 +538,10 @@ async fn run_data_generation(
         post_count.saturating_sub(pre_count)
     };
 
-    // Check for rejected writes (delta from pre-run baseline)
-    let post_rejected = client.execute_query(
-        "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
-    ).await.ok().and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64()))).unwrap_or(0);
-    let rejected_writes = post_rejected.saturating_sub(pre_rejected);
+    let rejected_writes = thread_pool_stats
+        .as_ref()
+        .map(|tp| tp.total_rejected)
+        .unwrap_or(0);
 
     if benchmark {
         // Benchmark mode: JSONL to stdout
