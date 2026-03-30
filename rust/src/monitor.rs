@@ -331,7 +331,7 @@ impl ThreadPoolMonitor {
                     _ = shutdown_rx.recv() => break,
                     _ = interval.tick() => {
                         if let Ok(rows) = client.execute_query(
-                            "SELECT name, thread_pools['write']['active'], thread_pools['write']['queue'] FROM sys.nodes ORDER BY name"
+                            "SELECT n.name, pool['active'], pool['queue'] FROM sys.nodes n, UNNEST(n.thread_pools) AS pool WHERE pool['name'] = 'write' ORDER BY n.name"
                         ).await {
                             let mut smap = samples.write().await;
                             for row in &rows {
@@ -349,7 +349,7 @@ impl ThreadPoolMonitor {
 
     async fn query_counters(&self) -> anyhow::Result<Vec<NodePoolCounters>> {
         let rows = self.client.execute_query(
-            "SELECT name, thread_pools['write']['threads'], thread_pools['write']['completed'], thread_pools['write']['rejected'] FROM sys.nodes ORDER BY name"
+            "SELECT n.name, pool['threads'], pool['completed'], pool['rejected'] FROM sys.nodes n, UNNEST(n.thread_pools) AS pool WHERE pool['name'] = 'write' ORDER BY n.name"
         ).await?;
 
         Ok(rows.iter().map(|row| {
