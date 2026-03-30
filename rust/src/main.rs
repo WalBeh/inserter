@@ -20,7 +20,7 @@ mod monitor;
 use client::CrateClient;
 use config::Config;
 use generator::RecordGenerator;
-use monitor::PerformanceMonitor;
+use monitor::{PerformanceMonitor, ThreadPoolMonitor};
 
 #[derive(Parser)]
 #[command(
@@ -292,6 +292,10 @@ async fn run_data_generation(
     // Query cluster info
     let cluster_info = query_cluster_info(&client).await;
 
+    // Create thread pool monitor and capture baseline counters
+    let tp_monitor = ThreadPoolMonitor::new(client.clone());
+    tp_monitor.capture_baseline().await;
+
     // Get pre-existing record count and rejected writes baseline
     let pre_count = {
         let _ = client
@@ -450,6 +454,9 @@ async fn run_data_generation(
         tasks.push(task);
     }
 
+    // Spawn thread pool poller (1s interval, collects active/queue per node)
+    let tp_poller = tp_monitor.spawn_poller(shutdown_tx.subscribe());
+
     // Spawn reporting task (collects rate samples; logs only in non-benchmark mode)
     let monitor_clone = monitor.clone();
     let shutdown_tx_clone = shutdown_tx.clone();
@@ -507,6 +514,10 @@ async fn run_data_generation(
         let _ = task.await;
     }
     let _ = reporting_task.await;
+    let _ = tp_poller.await;
+
+    // Finalize thread pool stats (query final counters, compute percentiles)
+    let thread_pool_stats = tp_monitor.finalize().await;
 
     // Collect one final rate sample
     let _ = monitor.get_current_stats().await;
@@ -555,10 +566,16 @@ async fn run_data_generation(
             "p95": (rate_stats.p95 / total_cpus * 10.0).round() / 10.0,
         });
 
+        // Build cluster info with thread pool stats
+        let mut cluster_with_tp = cluster_info.clone();
+        if let Some(ref tp) = thread_pool_stats {
+            cluster_with_tp["write_thread_pool"] = serde_json::json!(tp);
+        }
+
         let result = serde_json::json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "client": "rust-http",
-            "cluster": cluster_info,
+            "cluster": cluster_with_tp,
             "config": {
                 "threads": config.threads,
                 "initial_batch_size": config.batch_size,
