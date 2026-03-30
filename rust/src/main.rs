@@ -137,8 +137,8 @@ struct Cli {
     #[arg(long, default_value_t = 50)]
     queue_throttle_pct: u64,
 
-    /// Maximum throttle sleep in milliseconds (default: 30)
-    #[arg(long, default_value_t = 30)]
+    /// Maximum throttle sleep in milliseconds (default: 100)
+    #[arg(long, default_value_t = 100)]
     queue_throttle_max_ms: u64,
 }
 

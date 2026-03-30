@@ -378,15 +378,14 @@ impl ThreadPoolMonitor {
                                 let queue_pct = avg_queue / throttle_config.capacity as f64;
 
                                 if queue_pct > throttle_config.threshold_pct {
-                                    // Pressure: ramp up fast
+                                    // Pressure: jump directly to proportional target
                                     let overshoot = (queue_pct - throttle_config.threshold_pct)
                                         / (1.0 - throttle_config.threshold_pct);
                                     let target = overshoot * throttle_config.max_throttle_us as f64;
-                                    // Fast up: jump to at least 70% old + 30% new, or new if higher
-                                    current_throttle = (0.7 * current_throttle + 0.3 * target)
-                                        .max(current_throttle.min(target));
+                                    // Always take the higher of current or target (never reduce under pressure)
+                                    current_throttle = current_throttle.max(target);
                                 } else {
-                                    // Headroom: slow decay
+                                    // Headroom: slow decay (10% per second)
                                     current_throttle *= 0.9;
                                 }
 
