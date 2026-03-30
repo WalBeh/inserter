@@ -318,10 +318,16 @@ pub struct ThreadPoolMonitor {
     samples: Arc<RwLock<std::collections::BTreeMap<String, Vec<NodeSample>>>>,
     baseline: Arc<RwLock<Vec<NodePoolCounters>>>,
     /// Semaphore controlling max concurrent in-flight requests.
+    /// Initialized with a large number; the poller holds reserve permits to limit concurrency.
     pub concurrency_sem: Arc<tokio::sync::Semaphore>,
     /// Current target concurrency (for reporting).
     pub current_concurrency: Arc<AtomicU64>,
+    /// Total permits in the semaphore (workers never see more than max_concurrency).
+    total_permits: usize,
 }
+
+// Large enough that we can always steal from the pool without blocking.
+const SEM_TOTAL: usize = 1024;
 
 impl ThreadPoolMonitor {
     pub fn new(client: CrateClient, max_concurrency: usize) -> Self {
@@ -329,8 +335,9 @@ impl ThreadPoolMonitor {
             client,
             samples: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             baseline: Arc::new(RwLock::new(Vec::new())),
-            concurrency_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrency)),
+            concurrency_sem: Arc::new(tokio::sync::Semaphore::new(SEM_TOTAL)),
             current_concurrency: Arc::new(AtomicU64::new(max_concurrency as u64)),
+            total_permits: SEM_TOTAL,
         }
     }
 
@@ -350,14 +357,28 @@ impl ThreadPoolMonitor {
         let sem = self.concurrency_sem.clone();
         let current_concurrency = self.current_concurrency.clone();
         let max_concurrency = current_concurrency.load(Ordering::Relaxed) as usize;
-        // We hold "stolen" permits here to reduce concurrency
-        let mut stolen_permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
+        let total_permits = self.total_permits;
 
         tokio::spawn(async move {
+            // Grab reserve permits: hold (SEM_TOTAL - max_concurrency) so workers
+            // only see max_concurrency available. We use forget() to permanently
+            // remove permits; add_permits() to give them back.
+            let reserve = total_permits - max_concurrency;
+            sem.acquire_many(reserve as u32).await.expect("semaphore closed").forget();
+            // Now sem has exactly max_concurrency permits available.
+            // Track how many we've additionally stolen beyond the initial reserve.
+            let mut extra_stolen: usize = 0;
+
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.recv() => break,
+                    _ = shutdown_rx.recv() => {
+                        // Restore all stolen permits on shutdown
+                        if extra_stolen > 0 {
+                            sem.add_permits(extra_stolen);
+                        }
+                        break;
+                    },
                     _ = interval.tick() => {
                         if let Ok(rows) = client.execute_query(
                             "SELECT name, thread_pools FROM sys.nodes ORDER BY name"
@@ -375,47 +396,45 @@ impl ThreadPoolMonitor {
                                     smap.entry(name).or_default().push(NodeSample { active, queue });
                                 }
                             }
-                            drop(smap); // release write lock before permit operations
+                            drop(smap);
 
                             if throttle_config.enabled && node_count > 0 {
                                 let avg_queue = total_queue as f64 / node_count as f64;
                                 let queue_pct = avg_queue / throttle_config.capacity as f64;
 
-                                // Desired concurrency: linearly scale down from max when over threshold
                                 let desired = if queue_pct > throttle_config.threshold_pct {
                                     let pressure = (queue_pct - throttle_config.threshold_pct)
                                         / (1.0 - throttle_config.threshold_pct);
-                                    // Scale from max_concurrency down to min_concurrency (25% of max)
                                     let min_concurrency = (max_concurrency as f64 * 0.25).ceil() as usize;
                                     let target = max_concurrency as f64 - pressure * (max_concurrency - min_concurrency) as f64;
                                     (target as usize).max(min_concurrency)
                                 } else if queue_pct < throttle_config.threshold_pct * 0.5 {
-                                    // Well below threshold: restore toward max (release 1 permit per tick)
-                                    let current = max_concurrency - stolen_permits.len();
+                                    // Well below threshold: restore 1 per tick
+                                    let current = max_concurrency - extra_stolen;
                                     (current + 1).min(max_concurrency)
                                 } else {
-                                    // Between 50% of threshold and threshold: hold steady
-                                    max_concurrency - stolen_permits.len()
+                                    max_concurrency - extra_stolen
                                 };
 
-                                let current = max_concurrency - stolen_permits.len();
+                                let current = max_concurrency - extra_stolen;
 
                                 if desired < current {
-                                    // Need to reduce: steal permits
+                                    // Steal permits by forgetting them
                                     let to_steal = current - desired;
-                                    for _ in 0..to_steal {
-                                        if let Ok(permit) = sem.clone().try_acquire_owned() {
-                                            stolen_permits.push(permit);
-                                        }
+                                    // acquire_many will succeed because we have SEM_TOTAL permits total
+                                    if let Ok(permit) = sem.try_acquire_many(to_steal as u32) {
+                                        permit.forget();
+                                        extra_stolen += to_steal;
                                     }
-                                } else if desired > current && !stolen_permits.is_empty() {
-                                    // Need to increase: release stolen permits
-                                    let to_release = (desired - current).min(stolen_permits.len());
-                                    stolen_permits.truncate(stolen_permits.len() - to_release);
+                                } else if desired > current && extra_stolen > 0 {
+                                    // Release permits back
+                                    let to_release = (desired - current).min(extra_stolen);
+                                    sem.add_permits(to_release);
+                                    extra_stolen -= to_release;
                                 }
 
                                 current_concurrency.store(
-                                    (max_concurrency - stolen_permits.len()) as u64,
+                                    (max_concurrency - extra_stolen) as u64,
                                     Ordering::Relaxed,
                                 );
                             }
@@ -423,9 +442,6 @@ impl ThreadPoolMonitor {
                     }
                 }
             }
-
-            // Release all stolen permits on shutdown
-            drop(stolen_permits);
         })
     }
 
