@@ -980,10 +980,8 @@ fn worker(
                 monitor.add_batch(inserted as usize, latency_ms);
             }
             Err(err) => {
-                eprintln!("worker {worker_id}: insert failed: {err:#}");
+                tracing::error!("Worker {worker_id} error: {err:#}");
                 monitor.add_error();
-                stop.store(true, Ordering::Relaxed);
-                break;
             }
         }
 
