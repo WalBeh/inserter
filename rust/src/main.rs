@@ -622,6 +622,10 @@ async fn run_data_generation(
             .get("total_cpus")
             .and_then(|v| v.as_u64())
             .unwrap_or(1);
+        let effective_rec_per_cpu = (final_stats.total_records as f64
+            / final_stats.runtime_seconds
+            / total_cpus_int as f64)
+            .round();
         let rej_str = if rejected_writes > 0 {
             let total = final_stats.total_records.max(1) as f64;
             let rej_pct = (rejected_writes as f64 / total) * 100.0;
@@ -630,8 +634,8 @@ async fn run_data_generation(
             String::new()
         };
         eprintln!(
-            "CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0}{}",
-            version, total_cpus_int, rate_stats.p90, avg, p95, max, rej_str
+            "CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0} | effective rec/cpu/s={:.0}{}",
+            version, total_cpus_int, rate_stats.p90, avg, p95, max, effective_rec_per_cpu, rej_str
         );
     } else {
         // Normal mode
