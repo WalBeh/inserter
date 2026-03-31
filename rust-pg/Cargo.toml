@@ -1,0 +1,26 @@
+[package]
+name = "crate-write-pg-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Tiny CrateDB batch inserter over the PostgreSQL wire protocol"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT"
+
+[[bin]]
+name = "crate-write-pg"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.0", features = ["derive", "env"] }
+dotenvy = "0.15"
+native-tls = "0.2"
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+postgres-native-tls = "0.5"
+rand = { version = "0.8", features = ["small_rng"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.0"

@@ -7,10 +7,31 @@ pub struct Config {
     pub table_name: Option<String>,
     pub connection_string: Option<String>,
     pub duration: Option<u64>,
+    // Original batching parameters (might be overridden by adaptive batching)
     pub batch_size: usize,
     pub batch_interval: u64,
     pub threads: usize,
     pub objects: usize,
+
+    // Adaptive Batching settings
+    #[serde(default = "default_adaptive_batching")]
+    pub adaptive_batching: bool,
+    #[serde(default = "default_min_batch_size")]
+    pub min_batch_size: usize,
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: usize,
+    #[serde(default = "default_target_latency_ms")]
+    pub target_latency_ms: f64,
+    #[serde(default = "default_latency_tolerance_pct")]
+    pub latency_tolerance_pct: f64,
+    #[serde(default = "default_batch_size_factor")]
+    pub batch_size_factor: f64,
+    #[serde(default = "default_min_batch_interval")]
+    pub min_batch_interval: u64,
+    #[serde(default = "default_max_batch_interval")]
+    pub max_batch_interval: u64,
+    #[serde(default = "default_batch_interval_factor")]
+    pub batch_interval_factor: f64,
     #[serde(default = "default_shards")]
     pub shards: usize,
     #[serde(default = "default_replicas")]
@@ -20,8 +41,39 @@ pub struct Config {
     pub log_level: String,
 }
 
-fn default_shards() -> usize { 4 }
-fn default_replicas() -> usize { 1 }
+fn default_shards() -> usize {
+    4
+}
+fn default_replicas() -> usize {
+    1
+}
+fn default_adaptive_batching() -> bool {
+    false
+}
+fn default_min_batch_size() -> usize {
+    10
+}
+fn default_max_batch_size() -> usize {
+    10_000
+}
+fn default_target_latency_ms() -> f64 {
+    20.0
+}
+fn default_latency_tolerance_pct() -> f64 {
+    10.0
+}
+fn default_batch_size_factor() -> f64 {
+    1.1
+}
+fn default_min_batch_interval() -> u64 {
+    0
+}
+fn default_max_batch_interval() -> u64 {
+    1_000
+}
+fn default_batch_interval_factor() -> f64 {
+    1.1
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -35,6 +87,15 @@ impl Default for Config {
             objects: 0,
             shards: 4,
             replicas: 1,
+            adaptive_batching: default_adaptive_batching(),
+            min_batch_size: default_min_batch_size(),
+            max_batch_size: default_max_batch_size(),
+            target_latency_ms: default_target_latency_ms(),
+            latency_tolerance_pct: default_latency_tolerance_pct(),
+            batch_size_factor: default_batch_size_factor(),
+            min_batch_interval: default_min_batch_interval(),
+            max_batch_interval: default_max_batch_interval(),
+            batch_interval_factor: default_batch_interval_factor(),
             #[cfg(feature = "dashboard")]
             dashboard: false,
             log_level: "info".to_string(),
@@ -60,11 +121,9 @@ impl Config {
 
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let content = if path.as_ref().extension().and_then(|s| s.to_str()) == Some("toml") {
-            toml::to_string_pretty(self)
-                .context("Failed to serialize config to TOML")?
+            toml::to_string_pretty(self).context("Failed to serialize config to TOML")?
         } else {
-            serde_json::to_string_pretty(self)
-                .context("Failed to serialize config to JSON")?
+            serde_json::to_string_pretty(self).context("Failed to serialize config to JSON")?
         };
 
         std::fs::write(path.as_ref(), content)
@@ -112,22 +171,50 @@ impl Config {
                 .with_context(|| format!("Invalid connection string format: {}", conn_str))?;
         }
 
+        // Adaptive batching validation
+        if self.adaptive_batching {
+            if self.min_batch_size == 0 {
+                anyhow::bail!(
+                    "Min batch size must be greater than 0 when adaptive batching is enabled"
+                );
+            }
+            if self.max_batch_size < self.min_batch_size {
+                anyhow::bail!("Max batch size cannot be less than min batch size");
+            }
+            if self.target_latency_ms <= 0.0 {
+                anyhow::bail!("Target latency must be greater than 0");
+            }
+            if self.latency_tolerance_pct < 0.0 || self.latency_tolerance_pct >= 100.0 {
+                anyhow::bail!("Latency tolerance percentage must be between 0 and 100 (exclusive)");
+            }
+            if self.batch_size_factor <= 1.0 {
+                anyhow::bail!("Batch size factor must be greater than 1.0");
+            }
+            if self.max_batch_interval < self.min_batch_interval {
+                anyhow::bail!("Max batch interval cannot be less than min batch interval");
+            }
+            if self.batch_interval_factor <= 1.0 {
+                anyhow::bail!("Batch interval factor must be greater than 1.0");
+            }
+        }
+
         Ok(())
     }
 
     pub fn get_sanitized_connection_string(&self) -> Option<String> {
-        self.connection_string.as_ref().map(|conn_str| {
-            match url::Url::parse(conn_str) {
+        self.connection_string
+            .as_ref()
+            .map(|conn_str| match url::Url::parse(conn_str) {
                 Ok(url) => {
-                    format!("{}://{}:{}",
+                    format!(
+                        "{}://{}:{}",
                         url.scheme(),
                         url.host_str().unwrap_or("unknown"),
                         url.port().unwrap_or(4200)
                     )
                 }
                 Err(_) => "invalid-connection-string".to_string(),
-            }
-        })
+            })
     }
 
     pub fn merge_env_vars(&mut self) -> Result<()> {
@@ -143,12 +230,14 @@ impl Config {
         }
 
         if let Ok(batch_size) = std::env::var("CRATE_BATCH_SIZE") {
-            self.batch_size = batch_size.parse()
+            self.batch_size = batch_size
+                .parse()
                 .context("Invalid CRATE_BATCH_SIZE environment variable")?;
         }
 
         if let Ok(threads) = std::env::var("CRATE_THREADS") {
-            self.threads = threads.parse()
+            self.threads = threads
+                .parse()
                 .context("Invalid CRATE_THREADS environment variable")?;
         }
 

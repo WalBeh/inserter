@@ -3,23 +3,24 @@ use base64::Engine;
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn, error};
-
+use tracing::{debug, error, info, warn};
 
 mod client;
+mod config;
 mod generator;
 mod monitor;
-mod config;
 
 // Dashboard module disabled for now
 // #[cfg(feature = "dashboard")]
 // mod dashboard;
 
 use client::CrateClient;
-use generator::RecordGenerator;
-use monitor::PerformanceMonitor;
 use config::Config;
+use generator::RecordGenerator;
+use monitor::{PerformanceMonitor, ThreadPoolMonitor};
 
 #[derive(Parser)]
 #[command(
@@ -76,6 +77,42 @@ struct Cli {
     #[arg(long)]
     benchmark: bool,
 
+    /// Enable adaptive batching (dynamically adjusts batch_size and batch_interval)
+    #[arg(long)]
+    adaptive_batching: Option<bool>,
+
+    /// Minimum batch size when adaptive batching is enabled
+    #[arg(long)]
+    min_batch_size: Option<usize>,
+
+    /// Maximum batch size when adaptive batching is enabled
+    #[arg(long)]
+    max_batch_size: Option<usize>,
+
+    /// Target latency for inserts in milliseconds (adaptive batching)
+    #[arg(long)]
+    target_latency_ms: Option<f64>,
+
+    /// Percentage tolerance for target latency (adaptive batching)
+    #[arg(long)]
+    latency_tolerance_pct: Option<f64>,
+
+    /// Factor by which to increase/decrease batch size (adaptive batching)
+    #[arg(long)]
+    batch_size_factor: Option<f64>,
+
+    /// Minimum batch interval in milliseconds (adaptive batching)
+    #[arg(long)]
+    min_batch_interval: Option<u64>,
+
+    /// Maximum batch interval in milliseconds (adaptive batching)
+    #[arg(long)]
+    max_batch_interval: Option<u64>,
+
+    /// Factor by which to increase/decrease batch interval (adaptive batching)
+    #[arg(long)]
+    batch_interval_factor: Option<f64>,
+
     /// Number of shards for table creation
     #[arg(long)]
     shards: Option<usize>,
@@ -92,7 +129,8 @@ struct Cli {
 fn sanitize_connection_string(connection_string: &str) -> String {
     match url::Url::parse(connection_string) {
         Ok(url) => {
-            format!("{}://{}:{}",
+            format!(
+                "{}://{}:{}",
                 url.scheme(),
                 url.host_str().unwrap_or("unknown"),
                 url.port().unwrap_or(4200)
@@ -102,9 +140,13 @@ fn sanitize_connection_string(connection_string: &str) -> String {
     }
 }
 
-
-
-async fn create_table(client: &CrateClient, table_name: &str, objects: usize, shards: usize, replicas: usize) -> Result<()> {
+async fn create_table(
+    client: &CrateClient,
+    table_name: &str,
+    objects: usize,
+    shards: usize,
+    replicas: usize,
+) -> Result<()> {
     let mut columns = vec![
         "id TEXT PRIMARY KEY".to_string(),
         "timestamp TIMESTAMP WITH TIME ZONE".to_string(),
@@ -132,7 +174,9 @@ async fn create_table(client: &CrateClient, table_name: &str, objects: usize, sh
     );
 
     info!("Creating table: {}", table_name);
-    client.execute(&sql, &[]).await
+    client
+        .execute(&sql, &[])
+        .await
         .with_context(|| format!("Failed to create table {}", table_name))?;
 
     info!("✅ Table '{}' created successfully", table_name);
@@ -142,21 +186,42 @@ async fn create_table(client: &CrateClient, table_name: &str, objects: usize, sh
 async fn query_cluster_info(client: &CrateClient) -> serde_json::Value {
     let mut info = serde_json::json!({});
 
-    if let Ok(rows) = client.execute_query("SELECT os_info['available_processors'] FROM sys.nodes").await {
-        let cpus: Vec<u64> = rows.iter().filter_map(|r| r.first().and_then(|v| v.as_u64())).collect();
+    if let Ok(rows) = client
+        .execute_query("SELECT os_info['available_processors'] FROM sys.nodes")
+        .await
+    {
+        let cpus: Vec<u64> = rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_u64()))
+            .collect();
         info["cpus_per_node"] = serde_json::json!(cpus);
         info["total_cpus"] = serde_json::json!(cpus.iter().sum::<u64>());
         info["nodes"] = serde_json::json!(cpus.len());
     }
-    if let Ok(rows) = client.execute_query("SELECT mem['used'] FROM sys.nodes").await {
-        let mem: Vec<u64> = rows.iter().filter_map(|r| r.first().and_then(|v| v.as_u64())).collect();
+    if let Ok(rows) = client
+        .execute_query("SELECT mem['used'] FROM sys.nodes")
+        .await
+    {
+        let mem: Vec<u64> = rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_u64()))
+            .collect();
         info["memory_used_bytes"] = serde_json::json!(mem);
     }
-    if let Ok(rows) = client.execute_query("SELECT fs['total']['size'] FROM sys.nodes").await {
-        let disk: Vec<u64> = rows.iter().filter_map(|r| r.first().and_then(|v| v.as_u64())).collect();
+    if let Ok(rows) = client
+        .execute_query("SELECT fs['total']['size'] FROM sys.nodes")
+        .await
+    {
+        let disk: Vec<u64> = rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_u64()))
+            .collect();
         info["disk_total_bytes"] = serde_json::json!(disk);
     }
-    if let Ok(rows) = client.execute_query("SELECT heap['max'], version['number'] FROM sys.nodes LIMIT 1").await {
+    if let Ok(rows) = client
+        .execute_query("SELECT heap['max'], version['number'] FROM sys.nodes LIMIT 1")
+        .await
+    {
         if let Some(row) = rows.first() {
             if let Some(heap) = row.first().and_then(|v| v.as_u64()) {
                 info["heap_max_bytes"] = serde_json::json!(heap);
@@ -169,39 +234,98 @@ async fn query_cluster_info(client: &CrateClient) -> serde_json::Value {
     info
 }
 
+/// Shared state for worker tasks that allows dynamic adjustment of batching parameters.
+#[derive(Debug, Clone)]
+pub struct SharedWorkerState {
+    pub current_batch_size: Arc<AtomicUsize>,
+    pub current_batch_interval: Arc<AtomicU64>,
+    // Adaptive Batching parameters from Config
+    pub adaptive_batching_enabled: bool,
+    pub min_batch_size: usize,
+    pub max_batch_size: usize,
+    pub target_latency_ms: f64,
+    pub latency_tolerance_pct: f64,
+    pub batch_size_factor: f64,
+    pub min_batch_interval: u64,
+    pub max_batch_interval: u64,
+    pub batch_interval_factor: f64,
+}
+
+impl SharedWorkerState {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            current_batch_size: Arc::new(AtomicUsize::new(config.batch_size)),
+            current_batch_interval: Arc::new(AtomicU64::new(config.batch_interval)),
+            adaptive_batching_enabled: config.adaptive_batching,
+            min_batch_size: config.min_batch_size,
+            max_batch_size: config.max_batch_size,
+            target_latency_ms: config.target_latency_ms,
+            latency_tolerance_pct: config.latency_tolerance_pct,
+            batch_size_factor: config.batch_size_factor,
+            min_batch_interval: config.min_batch_interval,
+            max_batch_interval: config.max_batch_interval,
+            batch_interval_factor: config.batch_interval_factor,
+        }
+    }
+}
+
 async fn run_data_generation(
     client: CrateClient,
     config: Config,
     monitor: PerformanceMonitor,
     benchmark: bool,
 ) -> Result<()> {
+    let shared_worker_state = SharedWorkerState::new(&config);
+
     let table_name = config.table_name.as_ref().unwrap();
 
     // Create table
-    create_table(&client, table_name, config.objects, config.shards, config.replicas).await?;
+    create_table(
+        &client,
+        table_name,
+        config.objects,
+        config.shards,
+        config.replicas,
+    )
+    .await?;
 
     // Query cluster info
     let cluster_info = query_cluster_info(&client).await;
 
+    // Create thread pool monitor and capture baseline counters
+    let tp_monitor = ThreadPoolMonitor::new(client.clone());
+    tp_monitor.capture_baseline().await;
+
     // Get pre-existing record count and rejected writes baseline
     let pre_count = {
-        let _ = client.execute(&format!("REFRESH TABLE {}", table_name), &[]).await;
-        client.execute_query(&format!("SELECT COUNT(*) FROM {}", table_name)).await
+        let _ = client
+            .execute(&format!("REFRESH TABLE {}", table_name), &[])
+            .await;
+        client
+            .execute_query(&format!("SELECT COUNT(*) FROM {}", table_name))
+            .await
             .ok()
-            .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64())))
+            .and_then(|rows| {
+                rows.first()
+                    .and_then(|r| r.first().and_then(|v| v.as_u64()))
+            })
             .unwrap_or(0)
     };
-    let pre_rejected = client.execute_query(
-        "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
-    ).await.ok().and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64()))).unwrap_or(0);
-
     // Prepare insert statement
     let mut placeholders = vec!["?"; 10]; // Base fields
     placeholders.extend(vec!["?"; config.objects]); // Object fields
 
     let mut field_names = vec![
-        "id", "timestamp", "region", "product_category", "event_type",
-        "user_id", "user_segment", "amount", "quantity", "metadata"
+        "id",
+        "timestamp",
+        "region",
+        "product_category",
+        "event_type",
+        "user_id",
+        "user_segment",
+        "amount",
+        "quantity",
+        "metadata",
     ];
     let mut obj_field_names = Vec::new();
     for i in 0..config.objects {
@@ -231,11 +355,16 @@ async fn run_data_generation(
         let generator = RecordGenerator::new(config.objects);
         let insert_sql = insert_sql.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
-        let batch_size = config.batch_size;
-        let batch_interval = Duration::from_millis(config.batch_interval);
+        let worker_state = shared_worker_state.clone(); // Clone for each worker
 
         let task = tokio::spawn(async move {
             loop {
+                // Get current batch_size and batch_interval from shared state
+                let batch_size = worker_state.current_batch_size.load(Ordering::Relaxed);
+                let batch_interval = Duration::from_millis(
+                    worker_state.current_batch_interval.load(Ordering::Relaxed),
+                );
+
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
                         info!("Worker {} shutting down", worker_id);
@@ -243,7 +372,6 @@ async fn run_data_generation(
                     }
                     _ = async {
                         // Generate batch + convert to params on blocking thread
-                        // so tokio I/O threads stay free for HTTP requests
                         let gen = generator.clone();
                         let params = tokio::task::spawn_blocking(move || {
                             let batch = gen.generate_batch(batch_size);
@@ -252,15 +380,61 @@ async fn run_data_generation(
                                 .collect::<Vec<Vec<serde_json::Value>>>()
                         }).await.expect("batch generation panicked");
 
-                        // Insert batch — serialize+gzip also on blocking thread (inside execute_bulk)
-                        match client.execute_bulk(&insert_sql, params).await {
-                            Ok((bytes_sent, latency_ms)) => {
+                        // Insert batch
+                        let (success, latency_ms) = match client.execute_bulk(&insert_sql, params).await {
+                            Ok((bytes_sent, latency)) => {
                                 monitor.add_records(batch_size);
-                                monitor.add_request_stats(bytes_sent, latency_ms).await;
+                                monitor.add_request_stats(bytes_sent, latency).await;
+                                (true, latency)
                             }
                             Err(e) => {
                                 error!("Worker {} error: {}", worker_id, e);
                                 monitor.add_error();
+                                (false, -1.0) // Indicate error with negative latency or handle differently
+                            }
+                        };
+
+                        // Adaptive batching logic
+                        if worker_state.adaptive_batching_enabled {
+                            if success {
+                                if latency_ms < worker_state.target_latency_ms * (1.0 - worker_state.latency_tolerance_pct / 100.0) {
+                                    // Latency well below target, cautiously increase batch size
+                                    let current = worker_state.current_batch_size.load(Ordering::Relaxed);
+                                    let new_size = ((current as f64 * worker_state.batch_size_factor) as usize)
+                                        .min(worker_state.max_batch_size)
+                                        .max(worker_state.min_batch_size);
+                                    worker_state.current_batch_size.store(new_size, Ordering::Relaxed);
+                                    debug!("Worker {} increased batch_size to {}", worker_id, new_size);
+                                } else if latency_ms > worker_state.target_latency_ms * (1.0 + worker_state.latency_tolerance_pct / 100.0) {
+                                    // Latency too high, decrease batch size and increase interval
+                                    let current_size = worker_state.current_batch_size.load(Ordering::Relaxed);
+                                    let new_size = ((current_size as f64 / worker_state.batch_size_factor) as usize)
+                                        .min(worker_state.max_batch_size)
+                                        .max(worker_state.min_batch_size);
+                                    worker_state.current_batch_size.store(new_size, Ordering::Relaxed);
+                                    debug!("Worker {} decreased batch_size to {}", worker_id, new_size);
+
+                                    let current_interval = worker_state.current_batch_interval.load(Ordering::Relaxed);
+                                    let new_interval = ((current_interval as f64 * worker_state.batch_interval_factor) as u64)
+                                        .min(worker_state.max_batch_interval)
+                                        .max(worker_state.min_batch_interval);
+                                    worker_state.current_batch_interval.store(new_interval, Ordering::Relaxed);
+                                    debug!("Worker {} increased batch_interval to {}ms", worker_id, new_interval);
+                                }
+                            } else { // On error, aggressively reduce batch size and increase interval
+                                let current_size = worker_state.current_batch_size.load(Ordering::Relaxed);
+                                let new_size = ((current_size as f64 / (worker_state.batch_size_factor * 2.0)) as usize)
+                                    .min(worker_state.max_batch_size)
+                                    .max(worker_state.min_batch_size);
+                                worker_state.current_batch_size.store(new_size, Ordering::Relaxed);
+                                debug!("Worker {} (error) decreased batch_size to {}", worker_id, new_size);
+
+                                let current_interval = worker_state.current_batch_interval.load(Ordering::Relaxed);
+                                let new_interval = ((current_interval as f64 * (worker_state.batch_interval_factor * 2.0)) as u64)
+                                    .min(worker_state.max_batch_interval)
+                                    .max(worker_state.min_batch_interval);
+                                worker_state.current_batch_interval.store(new_interval, Ordering::Relaxed);
+                                debug!("Worker {} (error) increased batch_interval to {}ms", worker_id, new_interval);
                             }
                         }
 
@@ -276,13 +450,17 @@ async fn run_data_generation(
         tasks.push(task);
     }
 
+    // Spawn thread pool poller (1s interval, collects active/queue per node)
+    let tp_poller = tp_monitor.spawn_poller(shutdown_tx.subscribe());
+
     // Spawn reporting task (collects rate samples; logs only in non-benchmark mode)
     let monitor_clone = monitor.clone();
     let shutdown_tx_clone = shutdown_tx.clone();
     let benchmark_mode = benchmark;
     let num_threads = config.threads;
+    let worker_state_clone = shared_worker_state.clone(); // Clone for reporting task
     let reporting_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut shutdown_rx = shutdown_tx_clone.subscribe();
 
         loop {
@@ -290,15 +468,20 @@ async fn run_data_generation(
                 _ = shutdown_rx.recv() => break,
                 _ = interval.tick() => {
                     let stats = monitor_clone.get_current_stats().await;
+                    let current_batch_size = worker_state_clone.current_batch_size.load(Ordering::Relaxed);
+                    let current_batch_interval = worker_state_clone.current_batch_interval.load(Ordering::Relaxed);
+
                     if !benchmark_mode {
                         info!(
-                            "Performance: {:.1} records/sec (current), {:.1} records/sec (avg), Total: {} records, Batches: {}, Threads: {}, Errors: {}",
+                            "Performance: {:.1} records/sec (current), {:.1} records/sec (avg), Total: {} records, Batches: {}, Threads: {}, Errors: {}, Batch Size: {}, Batch Interval: {}ms",
                             stats.current_rate,
                             stats.average_rate,
                             stats.total_records,
                             stats.total_batches,
                             num_threads,
-                            stats.total_errors
+                            stats.total_errors,
+                            current_batch_size,
+                            current_batch_interval,
                         );
                     }
                 }
@@ -327,6 +510,10 @@ async fn run_data_generation(
         let _ = task.await;
     }
     let _ = reporting_task.await;
+    let _ = tp_poller.await;
+
+    // Finalize thread pool stats (query final counters, compute percentiles)
+    let thread_pool_stats = tp_monitor.finalize().await;
 
     // Collect one final rate sample
     let _ = monitor.get_current_stats().await;
@@ -336,19 +523,25 @@ async fn run_data_generation(
 
     // Verify records
     let verified_count = {
-        let _ = client.execute(&format!("REFRESH TABLE {}", table_name), &[]).await;
-        let post_count = client.execute_query(&format!("SELECT COUNT(*) FROM {}", table_name)).await
+        let _ = client
+            .execute(&format!("REFRESH TABLE {}", table_name), &[])
+            .await;
+        let post_count = client
+            .execute_query(&format!("SELECT COUNT(*) FROM {}", table_name))
+            .await
             .ok()
-            .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64())))
+            .and_then(|rows| {
+                rows.first()
+                    .and_then(|r| r.first().and_then(|v| v.as_u64()))
+            })
             .unwrap_or(0);
         post_count.saturating_sub(pre_count)
     };
 
-    // Check for rejected writes (delta from pre-run baseline)
-    let post_rejected = client.execute_query(
-        "SELECT SUM(pool['rejected']) FROM (SELECT UNNEST(thread_pools) AS pool FROM sys.nodes) x WHERE pool['name'] = 'write'"
-    ).await.ok().and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64()))).unwrap_or(0);
-    let rejected_writes = post_rejected.saturating_sub(pre_rejected);
+    let rejected_writes = thread_pool_stats
+        .as_ref()
+        .map(|tp| tp.total_rejected)
+        .unwrap_or(0);
 
     if benchmark {
         // Benchmark mode: JSONL to stdout
@@ -356,7 +549,10 @@ async fn run_data_generation(
         let latency_stats = monitor.get_latency_stats().await;
         let bandwidth_mbps = monitor.get_bandwidth_mbps().await;
         let bytes_sent = monitor.get_total_bytes_sent();
-        let total_cpus = cluster_info.get("total_cpus").and_then(|v| v.as_u64()).unwrap_or(1) as f64;
+        let total_cpus = cluster_info
+            .get("total_cpus")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as f64;
         let per_cpu = serde_json::json!({
             "avg": (rate_stats.avg / total_cpus * 10.0).round() / 10.0,
             "min": (rate_stats.min / total_cpus * 10.0).round() / 10.0,
@@ -365,18 +561,36 @@ async fn run_data_generation(
             "p95": (rate_stats.p95 / total_cpus * 10.0).round() / 10.0,
         });
 
+        // Build cluster info with thread pool stats
+        let mut cluster_with_tp = cluster_info.clone();
+        if let Some(ref tp) = thread_pool_stats {
+            cluster_with_tp["write_thread_pool"] = serde_json::json!(tp);
+        }
+
         let result = serde_json::json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "client": "rust-http",
-            "cluster": cluster_info,
+            "cluster": cluster_with_tp,
             "config": {
                 "threads": config.threads,
-                "batch_size": config.batch_size,
-                "batch_interval": config.batch_interval as f64 / 1000.0,
+                "initial_batch_size": config.batch_size,
+                "initial_batch_interval_ms": config.batch_interval,
+                "actual_final_batch_size": shared_worker_state.current_batch_size.load(Ordering::Relaxed),
+                "actual_final_batch_interval_ms": shared_worker_state.current_batch_interval.load(Ordering::Relaxed),
+                "num_objects_generated": config.objects,
                 "duration_minutes": config.duration.unwrap(),
                 "table_name": table_name,
                 "shards": config.shards,
                 "replicas": config.replicas,
+                "adaptive_batching_enabled": config.adaptive_batching,
+                "min_batch_size": config.min_batch_size,
+                "max_batch_size": config.max_batch_size,
+                "target_latency_ms": config.target_latency_ms,
+                "latency_tolerance_pct": config.latency_tolerance_pct,
+                "batch_size_factor": config.batch_size_factor,
+                "min_batch_interval": config.min_batch_interval,
+                "max_batch_interval": config.max_batch_interval,
+                "batch_interval_factor": config.batch_interval_factor,
             },
             "results": {
                 "total_records": final_stats.total_records,
@@ -391,21 +605,38 @@ async fn run_data_generation(
                 "verified_count": verified_count,
                 "rejected_writes": rejected_writes,
                 "rejected_pct": (rejected_writes as f64 / final_stats.total_records.max(1) as f64 * 100.0 * 100.0).round() / 100.0,
+                "average_batch_size": monitor.get_average_batch_size(),
+                "error_rate_pct": (monitor.get_error_rate().await * 10.0).round() / 10.0,
             }
         });
         println!("{}", serde_json::to_string(&result).unwrap());
         // Summary to stderr for quick reading
-        let version = cluster_info.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        let version = cluster_info
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         let avg = per_cpu.get("avg").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let p95 = per_cpu.get("p95").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let max = per_cpu.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let total_cpus_int = cluster_info.get("total_cpus").and_then(|v| v.as_u64()).unwrap_or(1);
+        let total_cpus_int = cluster_info
+            .get("total_cpus")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        let effective_rec_per_cpu = (final_stats.total_records as f64
+            / final_stats.runtime_seconds
+            / total_cpus_int as f64)
+            .round();
         let rej_str = if rejected_writes > 0 {
             let total = final_stats.total_records.max(1) as f64;
             let rej_pct = (rejected_writes as f64 / total) * 100.0;
             format!(" | REJECTED: {} ({:.1}%)", rejected_writes, rej_pct)
-        } else { String::new() };
-        eprintln!("CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0}{}", version, total_cpus_int, rate_stats.p90, avg, p95, max, rej_str);
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0} | effective rec/cpu/s={:.0}{}",
+            version, total_cpus_int, rate_stats.p90, avg, p95, max, effective_rec_per_cpu, rej_str
+        );
     } else {
         // Normal mode
         info!("{}", "=".repeat(60));
@@ -414,21 +645,40 @@ async fn run_data_generation(
         info!("✅ Worker threads: {}", config.threads);
         info!("✅ Total records sent: {}", final_stats.total_records);
         info!("✅ Total batches: {}", final_stats.total_batches);
-        info!("✅ Total runtime: {:.1} seconds", final_stats.runtime_seconds);
-        info!("✅ Average insertion rate: {:.1} records/second", final_stats.average_rate);
-        info!("✅ Records per thread: {:.0} avg", final_stats.total_records as f64 / config.threads as f64);
+        info!(
+            "✅ Total runtime: {:.1} seconds",
+            final_stats.runtime_seconds
+        );
+        info!(
+            "✅ Average insertion rate: {:.1} records/second",
+            final_stats.average_rate
+        );
+        info!(
+            "✅ Records per thread: {:.0} avg",
+            final_stats.total_records as f64 / config.threads as f64
+        );
         info!("✅ Total errors: {}", final_stats.total_errors);
         info!("{}", "=".repeat(60));
 
         info!("RECORD VERIFICATION");
-        info!("Records sent: {}  |  Verified in CrateDB: {}", final_stats.total_records, verified_count);
+        info!(
+            "Records sent: {}  |  Verified in CrateDB: {}",
+            final_stats.total_records, verified_count
+        );
         if verified_count == final_stats.total_records {
             info!("✅ MATCH");
         } else if verified_count > final_stats.total_records {
-            info!("ℹ️  CrateDB has {} extra (pre-existing data)", verified_count - final_stats.total_records);
+            info!(
+                "ℹ️  CrateDB has {} extra (pre-existing data)",
+                verified_count - final_stats.total_records
+            );
         } else {
             let missing = final_stats.total_records - verified_count;
-            warn!("⚠️  MISMATCH - {} missing ({:.2}% loss)", missing, (missing as f64 / final_stats.total_records as f64) * 100.0);
+            warn!(
+                "⚠️  MISMATCH - {} missing ({:.2}% loss)",
+                missing,
+                (missing as f64 / final_stats.total_records as f64) * 100.0
+            );
         }
         info!("{}", "=".repeat(60));
     }
@@ -457,13 +707,14 @@ async fn make_fresh_request(
     use_tls: bool,
     auth_header: Option<&str>,
 ) -> Result<FreshRequestResult> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let start_connect = Instant::now();
 
     let addr = format!("{}:{}", host, port);
-    let stream = tokio::net::TcpStream::connect(&addr).await
+    let stream = tokio::net::TcpStream::connect(&addr)
+        .await
         .with_context(|| format!("Failed to connect to {}", addr))?;
 
     let source_port = stream.local_addr()?.port();
@@ -559,8 +810,7 @@ fn shorten_node_name(name: &str) -> String {
 }
 
 async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
-    let parsed = url::Url::parse(connection_string)
-        .context("Invalid connection string")?;
+    let parsed = url::Url::parse(connection_string).context("Invalid connection string")?;
 
     let host = parsed.host_str().context("Missing hostname")?.to_string();
     let port = parsed.port().unwrap_or(4200);
@@ -577,18 +827,30 @@ async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
 
     println!("🔍 5-TUPLE LOAD BALANCER TEST");
     println!("{}", "=".repeat(60));
-    println!("Target: {}:{} ({})", host, port, if use_tls { "HTTPS" } else { "HTTP" });
+    println!(
+        "Target: {}:{} ({})",
+        host,
+        port,
+        if use_tls { "HTTPS" } else { "HTTP" }
+    );
 
     // Query sys.nodes to determine cluster size
     let expected_nodes = {
         let client = CrateClient::new(connection_string).await?;
-        match client.execute_query("SELECT count(*) as node_count FROM sys.nodes").await {
+        match client
+            .execute_query("SELECT count(*) as node_count FROM sys.nodes")
+            .await
+        {
             Ok(rows) => {
                 if let Some(first) = rows.first() {
                     if let Some(first_val) = first.first() {
                         first_val.as_u64().unwrap_or(1) as usize
-                    } else { 1 }
-                } else { 1 }
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                }
             }
             Err(_) => {
                 println!("⚠️  Could not determine cluster size, assuming 1 node");
@@ -599,7 +861,11 @@ async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
     println!("✅ Cluster has {} node(s)", expected_nodes);
 
     let num_requests = std::cmp::max(30, expected_nodes * 30);
-    println!("📊 Test plan: {} requests ({} per expected node)", num_requests, num_requests / expected_nodes);
+    println!(
+        "📊 Test plan: {} requests ({} per expected node)",
+        num_requests,
+        num_requests / expected_nodes
+    );
     println!();
 
     println!("📊 Request Details:");
@@ -619,7 +885,14 @@ async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
             Ok(result) => {
                 if result.node_name == "unknown" || result.node_name.starts_with("error") {
                     failed_requests += 1;
-                    println!("{:4} | {:10} | {:>7} | {:>8} | {:>7} | ERROR", i + 1, "ERROR", "N/A", "N/A", "N/A");
+                    println!(
+                        "{:4} | {:10} | {:>7} | {:>8} | {:>7} | ERROR",
+                        i + 1,
+                        "ERROR",
+                        "N/A",
+                        "N/A",
+                        "N/A"
+                    );
                 } else {
                     *node_counts.entry(result.node_name.clone()).or_insert(0) += 1;
                     source_ports.push(result.source_port);
@@ -630,14 +903,26 @@ async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
 
                     println!(
                         "{:4} | {:10} | {:7} | {:6.1}ms | {:5.1}ms | {:7.1}ms",
-                        i + 1, result.node_name, result.source_port,
-                        result.connect_time_ms, result.request_time_ms, result.total_time_ms
+                        i + 1,
+                        result.node_name,
+                        result.source_port,
+                        result.connect_time_ms,
+                        result.request_time_ms,
+                        result.total_time_ms
                     );
                 }
             }
             Err(e) => {
                 failed_requests += 1;
-                println!("{:4} | {:10} | {:>7} | {:>8} | {:>7} | {}", i + 1, "ERROR", "N/A", "N/A", "N/A", e);
+                println!(
+                    "{:4} | {:10} | {:>7} | {:>8} | {:>7} | {}",
+                    i + 1,
+                    "ERROR",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    e
+                );
             }
         }
 
@@ -647,7 +932,10 @@ async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
 
     println!("{}", "-".repeat(65));
 
-    let unique_ports = source_ports.iter().collect::<std::collections::HashSet<_>>().len();
+    let unique_ports = source_ports
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let unique_nodes = node_counts.len();
 
     // Summary
@@ -659,9 +947,18 @@ async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
     println!("   Unique nodes hit: {}", unique_nodes);
 
     if successful_requests > 0 {
-        println!("   Avg connect time: {:.1}ms", total_connect_ms / successful_requests as f64);
-        println!("   Avg request time: {:.1}ms", total_request_ms / successful_requests as f64);
-        println!("   Avg total time: {:.1}ms", total_time_ms / successful_requests as f64);
+        println!(
+            "   Avg connect time: {:.1}ms",
+            total_connect_ms / successful_requests as f64
+        );
+        println!(
+            "   Avg request time: {:.1}ms",
+            total_request_ms / successful_requests as f64
+        );
+        println!(
+            "   Avg total time: {:.1}ms",
+            total_time_ms / successful_requests as f64
+        );
     }
 
     // Distribution
@@ -671,7 +968,10 @@ async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
     for (name, count) in &sorted_nodes {
         let percentage = (**count as f64 / successful_requests as f64) * 100.0;
         let bar = "█".repeat((percentage / 2.0) as usize);
-        println!("   {:15} | {:3} hits | {:5.1}% | {}", name, count, percentage, bar);
+        println!(
+            "   {:15} | {:3} hits | {:5.1}% | {}",
+            name, count, percentage, bar
+        );
     }
 
     // 5-tuple analysis
@@ -679,14 +979,23 @@ async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
     if unique_ports < 2 {
         println!("   ❌ INCONCLUSIVE: Need more unique source ports to test");
     } else {
-        println!("   ✅ Good test conditions: {} different source ports", unique_ports);
+        println!(
+            "   ✅ Good test conditions: {} different source ports",
+            unique_ports
+        );
 
         if unique_nodes == 1 {
             println!("   🚨 VERDICT: Load balancer NOT using 5-tuple distribution");
-            println!("   📝 Evidence: {} different source ports, but all hit same node", unique_ports);
+            println!(
+                "   📝 Evidence: {} different source ports, but all hit same node",
+                unique_ports
+            );
         } else if unique_nodes > 1 {
             println!("   ✅ VERDICT: Load balancer IS distributing across nodes");
-            println!("   📝 Evidence: {} source ports hit {} different nodes", unique_ports, unique_nodes);
+            println!(
+                "   📝 Evidence: {} source ports hit {} different nodes",
+                unique_ports, unique_nodes
+            );
         }
     }
 
@@ -699,11 +1008,20 @@ async fn test_5tuple_distribution(connection_string: &str) -> Result<()> {
     println!("   Nodes hit during test: {}", unique_nodes);
 
     if unique_nodes == expected_nodes {
-        println!("   ✅ Perfect distribution - hit all {} nodes", expected_nodes);
+        println!(
+            "   ✅ Perfect distribution - hit all {} nodes",
+            expected_nodes
+        );
     } else if unique_nodes < expected_nodes {
-        println!("   ⚠️  Partial distribution - hit {}/{} nodes", unique_nodes, expected_nodes);
+        println!(
+            "   ⚠️  Partial distribution - hit {}/{} nodes",
+            unique_nodes, expected_nodes
+        );
     } else {
-        println!("   🤔 Unexpected - hit more nodes ({}) than expected ({})", unique_nodes, expected_nodes);
+        println!(
+            "   🤔 Unexpected - hit more nodes ({}) than expected ({})",
+            unique_nodes, expected_nodes
+        );
     }
 
     if unique_nodes == 1 && unique_ports > 5 {
@@ -726,7 +1044,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging (suppress in benchmark mode)
-    let effective_log_level = if cli.benchmark { "warn".to_string() } else { cli.log_level.clone() };
+    let effective_log_level = if cli.benchmark {
+        "warn".to_string()
+    } else {
+        cli.log_level.clone()
+    };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&effective_log_level));
 
@@ -749,7 +1071,10 @@ async fn main() -> Result<()> {
     // Debug: Check if environment variable is set
     match std::env::var("CRATE_CONNECTION_STRING") {
         Ok(value) => {
-            info!("✅ CRATE_CONNECTION_STRING environment variable is set (length: {})", value.len());
+            info!(
+                "✅ CRATE_CONNECTION_STRING environment variable is set (length: {})",
+                value.len()
+            );
         }
         Err(_) => {
             warn!("❌ CRATE_CONNECTION_STRING environment variable is NOT set");
@@ -767,7 +1092,10 @@ async fn main() -> Result<()> {
         info!("{}", "=".repeat(60));
         info!("This test creates fresh TCP connections to properly test");
         info!("whether load balancers use 5-tuple hashing for distribution.");
-        info!("🔗 Connection: {}", sanitize_connection_string(&connection_string));
+        info!(
+            "🔗 Connection: {}",
+            sanitize_connection_string(&connection_string)
+        );
 
         match test_5tuple_distribution(&connection_string).await {
             Ok(_) => {
@@ -820,17 +1148,58 @@ async fn main() -> Result<()> {
         config.replicas = replicas;
     }
 
+    // Adaptive batching CLI overrides
+    if let Some(adaptive_batching) = cli.adaptive_batching {
+        config.adaptive_batching = adaptive_batching;
+    }
+    if let Some(min_batch_size) = cli.min_batch_size {
+        config.min_batch_size = min_batch_size;
+    }
+    if let Some(max_batch_size) = cli.max_batch_size {
+        config.max_batch_size = max_batch_size;
+    }
+    if let Some(target_latency_ms) = cli.target_latency_ms {
+        config.target_latency_ms = target_latency_ms;
+    }
+    if let Some(latency_tolerance_pct) = cli.latency_tolerance_pct {
+        config.latency_tolerance_pct = latency_tolerance_pct;
+    }
+    if let Some(batch_size_factor) = cli.batch_size_factor {
+        config.batch_size_factor = batch_size_factor;
+    }
+    if let Some(min_batch_interval) = cli.min_batch_interval {
+        config.min_batch_interval = min_batch_interval;
+    }
+    if let Some(max_batch_interval) = cli.max_batch_interval {
+        config.max_batch_interval = max_batch_interval;
+    }
+    if let Some(batch_interval_factor) = cli.batch_interval_factor {
+        config.batch_interval_factor = batch_interval_factor;
+    }
+
     // Validate configuration
     config.validate()?;
 
     info!("🚀 CrateDB Record Generator (Rust)");
-    info!("Connection: {}", sanitize_connection_string(config.connection_string.as_ref().unwrap()));
+    info!(
+        "Connection: {}",
+        sanitize_connection_string(config.connection_string.as_ref().unwrap())
+    );
 
     // Create client with connection pool sized to thread count
     let pool_size = std::cmp::max(config.threads + 2, 10);
     let compress = !cli.no_compression;
-    let client = CrateClient::with_options(config.connection_string.as_ref().unwrap(), pool_size, compress).await?;
-    info!("Connection pool size: {}, compression: {}", pool_size, if compress { "gzip" } else { "off" });
+    let client = CrateClient::with_options(
+        config.connection_string.as_ref().unwrap(),
+        pool_size,
+        compress,
+    )
+    .await?;
+    info!(
+        "Connection pool size: {}, compression: {}",
+        pool_size,
+        if compress { "gzip" } else { "off" }
+    );
 
     // Create performance monitor
     let monitor = PerformanceMonitor::new();

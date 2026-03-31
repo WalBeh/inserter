@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
-use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::Compression;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Write;
 
+use base64::Engine;
 use tracing::{debug, error};
 use url::Url;
-use base64::Engine;
 
 #[derive(Clone)]
 pub struct CrateClient {
@@ -48,14 +48,19 @@ impl CrateClient {
         Self::with_options(connection_string, pool_size, true).await
     }
 
-    pub async fn with_options(connection_string: &str, pool_size: usize, compress: bool) -> Result<Self> {
+    pub async fn with_options(
+        connection_string: &str,
+        pool_size: usize,
+        compress: bool,
+    ) -> Result<Self> {
         let url = Url::parse(connection_string)
             .with_context(|| format!("Invalid connection string: {}", connection_string))?;
 
         let base_url = format!(
             "{}://{}:{}",
             url.scheme(),
-            url.host_str().context("Missing hostname in connection string")?,
+            url.host_str()
+                .context("Missing hostname in connection string")?,
             url.port().unwrap_or(4200)
         );
 
@@ -90,7 +95,8 @@ impl CrateClient {
     async fn make_request(&self, request: &SqlRequest) -> Result<SqlResponse> {
         let url = format!("{}/_sql", self.base_url);
 
-        let mut req_builder = self.client
+        let mut req_builder = self
+            .client
             .post(&url)
             .json(request)
             .header("Content-Type", "application/json");
@@ -114,8 +120,10 @@ impl CrateClient {
                 .await
                 .context("Failed to parse JSON response")?;
 
-            debug!("SQL executed successfully, rowcount: {}, duration: {}ms",
-                   sql_response.rowcount, sql_response.duration);
+            debug!(
+                "SQL executed successfully, rowcount: {}, duration: {}ms",
+                sql_response.rowcount, sql_response.duration
+            );
 
             Ok(sql_response)
         } else {
@@ -131,7 +139,11 @@ impl CrateClient {
     pub async fn execute(&self, sql: &str, args: &[Value]) -> Result<()> {
         let request = SqlRequest {
             stmt: sql.to_string(),
-            args: if args.is_empty() { None } else { Some(args.to_vec()) },
+            args: if args.is_empty() {
+                None
+            } else {
+                Some(args.to_vec())
+            },
             bulk_args: None,
         };
 
@@ -140,7 +152,11 @@ impl CrateClient {
 
     /// Accept owned bulk_args, gzip-compress on blocking thread, send to CrateDB.
     /// Returns (bytes_sent, latency_ms) for network stats tracking.
-    pub async fn execute_bulk(&self, sql: &str, bulk_args: Vec<Vec<Value>>) -> Result<(usize, f64)> {
+    pub async fn execute_bulk(
+        &self,
+        sql: &str,
+        bulk_args: Vec<Vec<Value>>,
+    ) -> Result<(usize, f64)> {
         if bulk_args.is_empty() {
             return Ok((0, 0.0));
         }
@@ -148,34 +164,39 @@ impl CrateClient {
         // Move CPU-heavy work (JSON serialize + optional gzip) to blocking thread pool
         let sql_owned = sql.to_string();
         let do_compress = self.compress;
-        let (body, is_compressed) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, bool)> {
-            let request = SqlRequest {
-                stmt: sql_owned,
-                args: None,
-                bulk_args: Some(bulk_args),
-            };
+        let (body, is_compressed) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, bool)> {
+                let request = SqlRequest {
+                    stmt: sql_owned,
+                    args: None,
+                    bulk_args: Some(bulk_args),
+                };
 
-            let json_bytes = serde_json::to_vec(&request)
-                .context("Failed to serialize bulk request")?;
+                let json_bytes =
+                    serde_json::to_vec(&request).context("Failed to serialize bulk request")?;
 
-            if do_compress {
-                let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-                encoder.write_all(&json_bytes)
-                    .context("Failed to gzip compress payload")?;
-                let compressed = encoder.finish()
-                    .context("Failed to finish gzip compression")?;
-                Ok((compressed, true))
-            } else {
-                Ok((json_bytes, false))
-            }
-        }).await
+                if do_compress {
+                    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+                    encoder
+                        .write_all(&json_bytes)
+                        .context("Failed to gzip compress payload")?;
+                    let compressed = encoder
+                        .finish()
+                        .context("Failed to finish gzip compression")?;
+                    Ok((compressed, true))
+                } else {
+                    Ok((json_bytes, false))
+                }
+            })
+            .await
             .context("Blocking task panicked")??;
 
         let bytes_sent = body.len();
         let start = std::time::Instant::now();
 
         let url = format!("{}/_sql", self.base_url);
-        let mut req_builder = self.client
+        let mut req_builder = self
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             .body(body);
@@ -195,14 +216,20 @@ impl CrateClient {
 
         let status = response.status();
         if status.is_success() {
-            let resp: SqlResponse = response.json().await
+            let resp: SqlResponse = response
+                .json()
+                .await
                 .context("Failed to parse bulk response")?;
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-            debug!("Bulk insert successful: {} records in {:.2}ms",
-                   resp.rowcount, resp.duration);
+            debug!(
+                "Bulk insert successful: {} records in {:.2}ms",
+                resp.rowcount, resp.duration
+            );
             Ok((bytes_sent, latency_ms))
         } else {
-            let error_text = response.text().await
+            let error_text = response
+                .text()
+                .await
                 .unwrap_or_else(|_| format!("HTTP {}", status));
             error!("Bulk insert failed: HTTP {} - {}", status, error_text);
             anyhow::bail!("Bulk insert failed: HTTP {} - {}", status, error_text);
