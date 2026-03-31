@@ -20,7 +20,7 @@ mod monitor;
 use client::CrateClient;
 use config::Config;
 use generator::RecordGenerator;
-use monitor::{PerformanceMonitor, QueueThrottleConfig, ThreadPoolMonitor};
+use monitor::{CpuThrottleConfig, PerformanceMonitor, QueueThrottleConfig, ThreadPoolMonitor};
 
 #[derive(Parser)]
 #[command(
@@ -137,6 +137,13 @@ struct Cli {
     #[arg(long, default_value_t = 50)]
     queue_throttle_pct: u64,
 
+    /// Enable CPU-based throttling (reduces concurrency when cluster CPU exceeds target)
+    #[arg(long)]
+    cpu_throttle: bool,
+
+    /// Target max cluster CPU percentage (default: 50)
+    #[arg(long, default_value_t = 50)]
+    max_cpu_load_pct: u64,
 }
 
 fn sanitize_connection_string(connection_string: &str) -> String {
@@ -287,7 +294,8 @@ async fn run_data_generation(
     config: Config,
     monitor: PerformanceMonitor,
     benchmark: bool,
-    throttle_config: QueueThrottleConfig,
+    queue_throttle: QueueThrottleConfig,
+    cpu_throttle: CpuThrottleConfig,
 ) -> Result<()> {
     let shared_worker_state = SharedWorkerState::new(&config);
 
@@ -371,7 +379,7 @@ async fn run_data_generation(
         let mut shutdown_rx = shutdown_tx.subscribe();
         let worker_state = shared_worker_state.clone();
         let concurrency_sem = tp_monitor.concurrency_sem.clone();
-        let throttle_enabled = throttle_config.enabled;
+        let throttle_enabled = queue_throttle.enabled || cpu_throttle.enabled;
 
         let task = tokio::spawn(async move {
             loop {
@@ -476,7 +484,7 @@ async fn run_data_generation(
     }
 
     // Spawn thread pool poller (1s interval, collects active/queue per node)
-    let tp_poller = tp_monitor.spawn_poller(shutdown_tx.subscribe(), throttle_config.clone());
+    let tp_poller = tp_monitor.spawn_poller(shutdown_tx.subscribe(), queue_throttle.clone(), cpu_throttle.clone());
 
     // Spawn reporting task (collects rate samples; logs only in non-benchmark mode)
     let monitor_clone = monitor.clone();
@@ -616,9 +624,11 @@ async fn run_data_generation(
                 "min_batch_interval": config.min_batch_interval,
                 "max_batch_interval": config.max_batch_interval,
                 "batch_interval_factor": config.batch_interval_factor,
-                "queue_throttle": throttle_config.enabled,
-                "queue_capacity": throttle_config.capacity,
-                "queue_throttle_pct": (throttle_config.threshold_pct * 100.0) as u64,
+                "queue_throttle": queue_throttle.enabled,
+                "queue_capacity": queue_throttle.capacity,
+                "queue_throttle_pct": (queue_throttle.threshold_pct * 100.0) as u64,
+                "cpu_throttle": cpu_throttle.enabled,
+                "max_cpu_load_pct": (cpu_throttle.max_cpu_pct * 100.0) as u64,
             },
             "results": {
                 "total_records": final_stats.total_records,
@@ -1234,12 +1244,16 @@ async fn main() -> Result<()> {
     let monitor = PerformanceMonitor::new();
 
     // Run data generation
-    let throttle_config = QueueThrottleConfig {
+    let queue_throttle = QueueThrottleConfig {
         enabled: cli.queue_throttle,
         capacity: cli.queue_capacity,
         threshold_pct: cli.queue_throttle_pct as f64 / 100.0,
     };
-    run_data_generation(client, config, monitor, cli.benchmark, throttle_config).await?;
+    let cpu_throttle = CpuThrottleConfig {
+        enabled: cli.cpu_throttle,
+        max_cpu_pct: cli.max_cpu_load_pct as f64 / 100.0,
+    };
+    run_data_generation(client, config, monitor, cli.benchmark, queue_throttle, cpu_throttle).await?;
 
     Ok(())
 }
