@@ -20,7 +20,7 @@ mod monitor;
 use client::CrateClient;
 use config::Config;
 use generator::RecordGenerator;
-use monitor::{PerformanceMonitor, ThreadPoolMonitor};
+use monitor::{PerformanceMonitor, QueueThrottleConfig, ThreadPoolMonitor};
 
 #[derive(Parser)]
 #[command(
@@ -124,6 +124,19 @@ struct Cli {
     /// Disable gzip compression (faster on localhost/low-latency)
     #[arg(long)]
     no_compression: bool,
+
+    /// Enable queue-based throttling (adjusts worker sleep based on write queue depth)
+    #[arg(long)]
+    queue_throttle: bool,
+
+    /// Write thread pool queue capacity (default: 200, matches CrateDB default)
+    #[arg(long, default_value_t = 200)]
+    queue_capacity: u64,
+
+    /// Queue fill percentage at which throttling starts (default: 50)
+    #[arg(long, default_value_t = 50)]
+    queue_throttle_pct: u64,
+
 }
 
 fn sanitize_connection_string(connection_string: &str) -> String {
@@ -274,6 +287,7 @@ async fn run_data_generation(
     config: Config,
     monitor: PerformanceMonitor,
     benchmark: bool,
+    throttle_config: QueueThrottleConfig,
 ) -> Result<()> {
     let shared_worker_state = SharedWorkerState::new(&config);
 
@@ -293,7 +307,7 @@ async fn run_data_generation(
     let cluster_info = query_cluster_info(&client).await;
 
     // Create thread pool monitor and capture baseline counters
-    let tp_monitor = ThreadPoolMonitor::new(client.clone());
+    let tp_monitor = ThreadPoolMonitor::new(client.clone(), config.threads);
     tp_monitor.capture_baseline().await;
 
     // Get pre-existing record count and rejected writes baseline
@@ -355,7 +369,9 @@ async fn run_data_generation(
         let generator = RecordGenerator::new(config.objects);
         let insert_sql = insert_sql.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
-        let worker_state = shared_worker_state.clone(); // Clone for each worker
+        let worker_state = shared_worker_state.clone();
+        let concurrency_sem = tp_monitor.concurrency_sem.clone();
+        let throttle_enabled = throttle_config.enabled;
 
         let task = tokio::spawn(async move {
             loop {
@@ -380,6 +396,13 @@ async fn run_data_generation(
                                 .collect::<Vec<Vec<serde_json::Value>>>()
                         }).await.expect("batch generation panicked");
 
+                        // Acquire concurrency permit (blocks if throttle has reduced permits)
+                        let _permit = if throttle_enabled {
+                            Some(concurrency_sem.acquire().await.expect("semaphore closed"))
+                        } else {
+                            None
+                        };
+
                         // Insert batch
                         let (success, latency_ms) = match client.execute_bulk(&insert_sql, params).await {
                             Ok((bytes_sent, latency)) => {
@@ -390,9 +413,11 @@ async fn run_data_generation(
                             Err(e) => {
                                 error!("Worker {} error: {}", worker_id, e);
                                 monitor.add_error();
-                                (false, -1.0) // Indicate error with negative latency or handle differently
+                                (false, -1.0)
                             }
                         };
+
+                        drop(_permit); // release permit after response
 
                         // Adaptive batching logic
                         if worker_state.adaptive_batching_enabled {
@@ -451,7 +476,7 @@ async fn run_data_generation(
     }
 
     // Spawn thread pool poller (1s interval, collects active/queue per node)
-    let tp_poller = tp_monitor.spawn_poller(shutdown_tx.subscribe());
+    let tp_poller = tp_monitor.spawn_poller(shutdown_tx.subscribe(), throttle_config.clone());
 
     // Spawn reporting task (collects rate samples; logs only in non-benchmark mode)
     let monitor_clone = monitor.clone();
@@ -591,6 +616,9 @@ async fn run_data_generation(
                 "min_batch_interval": config.min_batch_interval,
                 "max_batch_interval": config.max_batch_interval,
                 "batch_interval_factor": config.batch_interval_factor,
+                "queue_throttle": throttle_config.enabled,
+                "queue_capacity": throttle_config.capacity,
+                "queue_throttle_pct": (throttle_config.threshold_pct * 100.0) as u64,
             },
             "results": {
                 "total_records": final_stats.total_records,
@@ -607,6 +635,7 @@ async fn run_data_generation(
                 "rejected_pct": (rejected_writes as f64 / final_stats.total_records.max(1) as f64 * 100.0 * 100.0).round() / 100.0,
                 "average_batch_size": monitor.get_average_batch_size(),
                 "error_rate_pct": (monitor.get_error_rate().await * 10.0).round() / 10.0,
+                "final_concurrency": tp_monitor.current_concurrency.load(Ordering::Relaxed),
             }
         });
         println!("{}", serde_json::to_string(&result).unwrap());
@@ -1205,7 +1234,12 @@ async fn main() -> Result<()> {
     let monitor = PerformanceMonitor::new();
 
     // Run data generation
-    run_data_generation(client, config, monitor, cli.benchmark).await?;
+    let throttle_config = QueueThrottleConfig {
+        enabled: cli.queue_throttle,
+        capacity: cli.queue_capacity,
+        threshold_pct: cli.queue_throttle_pct as f64 / 100.0,
+    };
+    run_data_generation(client, config, monitor, cli.benchmark, throttle_config).await?;
 
     Ok(())
 }
