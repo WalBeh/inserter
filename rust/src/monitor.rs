@@ -389,7 +389,7 @@ impl ThreadPoolMonitor {
                     },
                     _ = interval.tick() => {
                         if let Ok(rows) = client.execute_query(
-                            "SELECT name, thread_pools, os['cpu']['used'] FROM sys.nodes ORDER BY name"
+                            "SELECT name, thread_pools, process['cpu']['percent'] FROM sys.nodes ORDER BY name"
                         ).await {
                             let mut total_queue: u64 = 0;
                             let mut total_cpu: f64 = 0.0;
