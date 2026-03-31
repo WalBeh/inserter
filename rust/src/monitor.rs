@@ -273,6 +273,7 @@ fn find_write_pool(value: Option<&serde_json::Value>) -> Option<&serde_json::Map
 struct NodeSample {
     active: u64,
     queue: u64,
+    cpu: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +290,7 @@ pub struct NodeThreadPoolStats {
     pub pool_size: u64,
     pub active: PercentileStats,
     pub queued: PercentileStats,
+    pub cpu_usage: PercentileStats,
     pub completed_delta: u64,
     pub rejected_delta: u64,
 }
@@ -300,6 +302,7 @@ pub struct ClusterThreadPoolStats {
     pub total_rejected: u64,
     pub active_threads: PercentileStats,
     pub queued_tasks: PercentileStats,
+    pub cpu_usage: PercentileStats,
     pub samples: usize,
     pub nodes: Vec<NodeThreadPoolStats>,
 }
@@ -394,15 +397,14 @@ impl ThreadPoolMonitor {
                             let mut smap = samples.write().await;
                             for row in &rows {
                                 let name = row.first().and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                                let cpu = row.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                total_cpu += cpu;
                                 if let Some(pool) = find_write_pool(row.get(1)) {
                                     let active = pool.get("active").and_then(|v| v.as_u64()).unwrap_or(0);
                                     let queue = pool.get("queue").and_then(|v| v.as_u64()).unwrap_or(0);
                                     total_queue += queue;
                                     node_count += 1;
-                                    smap.entry(name).or_default().push(NodeSample { active, queue });
-                                }
-                                if let Some(cpu) = row.get(2).and_then(|v| v.as_f64()) {
-                                    total_cpu += cpu;
+                                    smap.entry(name).or_default().push(NodeSample { active, queue, cpu });
                                 }
                             }
                             drop(smap);
@@ -535,6 +537,9 @@ impl ThreadPoolMonitor {
             let queue_vals: Vec<f64> = node_samples
                 .map(|s| s.iter().map(|ns| ns.queue as f64).collect())
                 .unwrap_or_default();
+            let cpu_vals: Vec<f64> = node_samples
+                .map(|s| s.iter().map(|ns| ns.cpu).collect())
+                .unwrap_or_default();
 
             if let Some(s) = node_samples {
                 num_samples = num_samples.max(s.len());
@@ -545,6 +550,7 @@ impl ThreadPoolMonitor {
                 pool_size: fc.pool_size,
                 active: compute_percentiles(&active_vals),
                 queued: compute_percentiles(&queue_vals),
+                cpu_usage: compute_percentiles(&cpu_vals),
                 completed_delta,
                 rejected_delta,
             });
@@ -561,6 +567,14 @@ impl ThreadPoolMonitor {
                 samples.values().filter_map(|v| v.get(i)).map(|s| s.queue as f64).sum()
             })
             .collect();
+        // CPU: average across nodes (not sum)
+        let node_count = samples.len().max(1) as f64;
+        let cluster_cpu: Vec<f64> = (0..num_samples)
+            .map(|i| {
+                let sum: f64 = samples.values().filter_map(|v| v.get(i)).map(|s| s.cpu).sum();
+                sum / node_count
+            })
+            .collect();
 
         Some(ClusterThreadPoolStats {
             total_pool_size,
@@ -568,6 +582,7 @@ impl ThreadPoolMonitor {
             total_rejected,
             active_threads: compute_percentiles(&cluster_active),
             queued_tasks: compute_percentiles(&cluster_queue),
+            cpu_usage: compute_percentiles(&cluster_cpu),
             samples: num_samples,
             nodes,
         })
