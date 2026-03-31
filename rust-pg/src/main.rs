@@ -82,6 +82,14 @@ struct Cli {
     /// Queue fill percentage at which throttling starts (default: 50)
     #[arg(long, default_value_t = 50)]
     queue_throttle_pct: u64,
+
+    /// Enable CPU-based throttling (reduces concurrency when cluster CPU exceeds target)
+    #[arg(long)]
+    cpu_throttle: bool,
+
+    /// Target max cluster CPU percentage (default: 50)
+    #[arg(long, default_value_t = 50)]
+    max_cpu_load_pct: u64,
 }
 
 #[derive(Clone)]
@@ -261,6 +269,7 @@ fn compute_percentiles(samples: &[f64]) -> PercentileStats {
 struct NodeSample {
     active: u64,
     queue: u64,
+    cpu: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +286,7 @@ struct NodeThreadPoolStats {
     pool_size: u64,
     active: PercentileStats,
     queued: PercentileStats,
+    cpu_usage: PercentileStats,
     completed_delta: u64,
     rejected_delta: u64,
 }
@@ -288,6 +298,7 @@ struct ClusterThreadPoolStats {
     total_rejected: u64,
     active_threads: PercentileStats,
     queued_tasks: PercentileStats,
+    cpu_usage: PercentileStats,
     samples: usize,
     nodes: Vec<NodeThreadPoolStats>,
 }
@@ -305,7 +316,7 @@ fn find_write_pool(pools: &JsonValue) -> Option<&serde_json::Map<String, JsonVal
 /// over the PG wire protocol; we parse it as JSON.
 /// Query thread_pools via CrateDB's HTTP /_sql endpoint since the PG wire
 /// protocol cannot serialize OBJECT/ARRAY(OBJECT) types from sys.nodes.
-fn query_thread_pools_http(http_url: &str) -> Vec<(String, JsonValue)> {
+fn query_thread_pools_http(http_url: &str) -> Vec<(String, JsonValue, f64)> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -315,7 +326,7 @@ fn query_thread_pools_http(http_url: &str) -> Vec<(String, JsonValue)> {
     };
     let host = url.host_str().unwrap_or("localhost");
     let port = url.port().unwrap_or(4200);
-    let body = r#"{"stmt":"SELECT name, thread_pools FROM sys.nodes ORDER BY name"}"#;
+    let body = r#"{"stmt":"SELECT name, thread_pools, process['cpu']['percent'] FROM sys.nodes ORDER BY name"}"#;
 
     let mut stream = match TcpStream::connect((host, port)) {
         Ok(s) => s,
@@ -354,7 +365,8 @@ fn query_thread_pools_http(http_url: &str) -> Vec<(String, JsonValue)> {
                 .filter_map(|row| {
                     let name = row.get(0)?.as_str()?.to_string();
                     let pools = row.get(1)?.clone();
-                    Some((name, pools))
+                    let cpu = row.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    Some((name, pools, cpu))
                 })
                 .collect()
         })
@@ -364,7 +376,7 @@ fn query_thread_pools_http(http_url: &str) -> Vec<(String, JsonValue)> {
 fn query_thread_pool_counters(http_url: &str) -> Vec<NodePoolCounters> {
     query_thread_pools_http(http_url)
         .into_iter()
-        .filter_map(|(name, pools)| {
+        .filter_map(|(name, pools, _cpu)| {
             let pool = find_write_pool(&pools)?;
             Some(NodePoolCounters {
                 name,
@@ -379,11 +391,12 @@ fn query_thread_pool_counters(http_url: &str) -> Vec<NodePoolCounters> {
 fn poll_thread_pool_samples(http_url: &str) -> Vec<(String, NodeSample)> {
     query_thread_pools_http(http_url)
         .into_iter()
-        .filter_map(|(name, pools)| {
+        .filter_map(|(name, pools, cpu)| {
             let pool = find_write_pool(&pools)?;
             Some((name, NodeSample {
                 active: pool.get("active").and_then(|v| v.as_u64()).unwrap_or(0),
                 queue: pool.get("queue").and_then(|v| v.as_u64()).unwrap_or(0),
+                cpu,
             }))
         })
         .collect()
@@ -428,6 +441,9 @@ fn finalize_thread_pool_stats(
         let queue_vals: Vec<f64> = node_samples
             .map(|s| s.iter().map(|ns| ns.queue as f64).collect())
             .unwrap_or_default();
+        let cpu_vals: Vec<f64> = node_samples
+            .map(|s| s.iter().map(|ns| ns.cpu).collect())
+            .unwrap_or_default();
 
         if let Some(s) = node_samples {
             num_samples = num_samples.max(s.len());
@@ -438,6 +454,7 @@ fn finalize_thread_pool_stats(
             pool_size: fc.pool_size,
             active: compute_percentiles(&active_vals),
             queued: compute_percentiles(&queue_vals),
+            cpu_usage: compute_percentiles(&cpu_vals),
             completed_delta,
             rejected_delta,
         });
@@ -449,6 +466,13 @@ fn finalize_thread_pool_stats(
     let cluster_queue: Vec<f64> = (0..num_samples)
         .map(|i| samples.values().filter_map(|v| v.get(i)).map(|s| s.queue as f64).sum())
         .collect();
+    let node_count = samples.len().max(1) as f64;
+    let cluster_cpu: Vec<f64> = (0..num_samples)
+        .map(|i| {
+            let sum: f64 = samples.values().filter_map(|v| v.get(i)).map(|s| s.cpu).sum();
+            sum / node_count
+        })
+        .collect();
 
     Some(ClusterThreadPoolStats {
         total_pool_size,
@@ -456,6 +480,7 @@ fn finalize_thread_pool_stats(
         total_rejected,
         active_threads: compute_percentiles(&cluster_active),
         queued_tasks: compute_percentiles(&cluster_queue),
+        cpu_usage: compute_percentiles(&cluster_cpu),
         samples: num_samples,
         nodes,
     })
@@ -793,6 +818,8 @@ fn build_report(
             "queue_throttle": cli.queue_throttle,
             "queue_capacity": cli.queue_capacity,
             "queue_throttle_pct": cli.queue_throttle_pct,
+            "cpu_throttle": cli.cpu_throttle,
+            "max_cpu_load_pct": cli.max_cpu_load_pct,
         },
         "results": {
             "total_records": final_stats.get("total_records").cloned().unwrap_or(json!(0)),
@@ -864,9 +891,12 @@ fn main() -> Result<()> {
 
     // Concurrency limiter
     let limiter = Arc::new(ConcurrencyLimiter::new(cli.threads));
-    let throttle_enabled = cli.queue_throttle;
+    let queue_throttle_enabled = cli.queue_throttle;
+    let cpu_throttle_enabled = cli.cpu_throttle;
+    let either_throttle = queue_throttle_enabled || cpu_throttle_enabled;
     let queue_capacity = cli.queue_capacity as f64;
     let threshold_pct = cli.queue_throttle_pct as f64 / 100.0;
+    let max_cpu_pct = cli.max_cpu_load_pct as f64 / 100.0;
     let max_concurrency = cli.threads;
     let min_concurrency = (max_concurrency as f64 * 0.25).ceil() as usize;
 
@@ -896,30 +926,54 @@ fn main() -> Result<()> {
 
                 let polled = poll_thread_pool_samples(&http_url_for_reporter);
                 let mut total_queue: u64 = 0;
+                let mut total_cpu: f64 = 0.0;
                 let mut node_count: u64 = 0;
                 for (name, sample) in &polled {
                     total_queue += sample.queue;
+                    total_cpu += sample.cpu;
                     node_count += 1;
                     tp_samples.entry(name.clone()).or_default().push(sample.clone());
                 }
 
-                // Adjust concurrency based on queue depth
-                if throttle_enabled && node_count > 0 {
-                    let avg_queue = total_queue as f64 / node_count as f64;
-                    let queue_pct = avg_queue / queue_capacity;
+                if either_throttle && node_count > 0 {
+                    let current = limiter_for_reporter.current_max();
 
-                    let desired = if queue_pct > threshold_pct {
-                        let pressure = (queue_pct - threshold_pct) / (1.0 - threshold_pct);
-                        let target = max_concurrency as f64 - pressure * (max_concurrency - min_concurrency) as f64;
-                        (target as usize).max(min_concurrency)
-                    } else if queue_pct < threshold_pct * 0.5 {
-                        // Well below threshold: restore 1 per tick
-                        (limiter_for_reporter.current_max() + 1).min(max_concurrency)
+                    // Queue-based desired concurrency
+                    let queue_desired = if queue_throttle_enabled {
+                        let avg_queue = total_queue as f64 / node_count as f64;
+                        let queue_pct = avg_queue / queue_capacity;
+
+                        if queue_pct > threshold_pct {
+                            let pressure = (queue_pct - threshold_pct) / (1.0 - threshold_pct);
+                            let target = max_concurrency as f64 - pressure * (max_concurrency - min_concurrency) as f64;
+                            (target as usize).max(min_concurrency)
+                        } else if queue_pct < threshold_pct * 0.5 {
+                            (current + 1).min(max_concurrency)
+                        } else {
+                            current
+                        }
                     } else {
-                        limiter_for_reporter.current_max()
+                        max_concurrency
                     };
 
-                    limiter_for_reporter.set_max(desired);
+                    // CPU-based desired concurrency
+                    let cpu_desired = if cpu_throttle_enabled {
+                        let avg_cpu = total_cpu / node_count as f64 / 100.0;
+
+                        if avg_cpu > max_cpu_pct {
+                            let overshoot = (avg_cpu - max_cpu_pct) / (1.0 - max_cpu_pct);
+                            let target = max_concurrency as f64 - overshoot * (max_concurrency - min_concurrency) as f64;
+                            (target as usize).max(min_concurrency)
+                        } else if avg_cpu < max_cpu_pct * 0.5 {
+                            (current + 1).min(max_concurrency)
+                        } else {
+                            current
+                        }
+                    } else {
+                        max_concurrency
+                    };
+
+                    limiter_for_reporter.set_max(queue_desired.min(cpu_desired));
                 }
             }
 
@@ -938,7 +992,7 @@ fn main() -> Result<()> {
         let mon = Arc::clone(&monitor);
         let stp = Arc::clone(&stop);
         let lim = Arc::clone(&limiter);
-        let thr = throttle_enabled;
+        let thr = either_throttle;
 
         handles.push(thread::spawn(move || worker(
             worker_id, conn_str, table, objects, batch_size, interval, deadline, mon, stp, lim, thr,
