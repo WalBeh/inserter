@@ -658,6 +658,7 @@ async fn run_data_generation(
                 "error_rate_pct": (monitor.get_error_rate().await * 10.0).round() / 10.0,
                 "final_concurrency": tp_monitor.current_concurrency.load(Ordering::Relaxed),
                 "avg_row_bytes_on_disk": avg_row_bytes,
+                "avg_payload_bytes": if final_stats.total_records > 0 { bytes_sent / final_stats.total_records } else { 0 },
             }
         });
         println!("{}", serde_json::to_string(&result).unwrap());
