@@ -103,7 +103,7 @@ struct PgRecord {
     user_segment: String,
     amount: f64,
     quantity: i32,
-    metadata: String,
+    metadata: serde_json::Value,
     objects: Vec<String>,
 }
 
@@ -111,10 +111,10 @@ impl PgRecord {
     /// Estimate PG wire payload size: 4-byte length prefix per field + field data.
     fn estimated_wire_bytes(&self) -> usize {
         let fixed = 4 + 8 + 4 + 8 + 4; // user_id(i32) + timestamp(i64) + quantity(i32) + amount(f64) + per-field overhead
+        let metadata_len = serde_json::to_string(&self.metadata).map(|s| s.len()).unwrap_or(64);
         let strings = self.id.len() + self.region.len() + self.product_category.len()
-            + self.event_type.len() + self.user_segment.len() + self.metadata.len()
+            + self.event_type.len() + self.user_segment.len() + metadata_len
             + self.objects.iter().map(|s| s.len()).sum::<usize>();
-        // Each field has a 4-byte length prefix in the PG wire protocol
         let num_fields = 10 + self.objects.len();
         fixed + strings + num_fields * 4
     }
@@ -627,7 +627,7 @@ fn record_to_pg(record: Record) -> PgRecord {
         user_segment: record.user_segment,
         amount: record.amount,
         quantity: record.quantity as i32,
-        metadata: record.metadata,
+        metadata: serde_json::from_str(&record.metadata).unwrap_or(serde_json::Value::Null),
         objects: record.objects,
     }
 }
@@ -643,7 +643,7 @@ fn build_columns(object_count: usize) -> Vec<String> {
         "user_segment TEXT".to_string(),
         "amount DOUBLE PRECISION".to_string(),
         "quantity INTEGER".to_string(),
-        "metadata TEXT".to_string(),
+        "metadata OBJECT(DYNAMIC)".to_string(),
     ];
 
     for i in 0..object_count {
