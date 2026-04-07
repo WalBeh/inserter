@@ -374,7 +374,7 @@ async fn run_data_generation(
     for worker_id in 0..config.threads {
         let client = client.clone();
         let monitor = monitor.clone();
-        let generator = RecordGenerator::new(config.objects);
+        let generator = Arc::new(std::sync::Mutex::new(RecordGenerator::new(config.objects)));
         let insert_sql = insert_sql.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let worker_state = shared_worker_state.clone();
@@ -398,7 +398,7 @@ async fn run_data_generation(
                         // Generate batch + convert to params on blocking thread
                         let gen = generator.clone();
                         let params = tokio::task::spawn_blocking(move || {
-                            let batch = gen.generate_batch(batch_size);
+                            let batch = gen.lock().expect("generator lock poisoned").generate_batch(batch_size);
                             batch.into_iter()
                                 .map(|record| record.into_params())
                                 .collect::<Vec<Vec<serde_json::Value>>>()
