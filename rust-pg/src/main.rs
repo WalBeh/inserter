@@ -107,6 +107,19 @@ struct PgRecord {
     objects: Vec<String>,
 }
 
+impl PgRecord {
+    /// Estimate PG wire payload size: 4-byte length prefix per field + field data.
+    fn estimated_wire_bytes(&self) -> usize {
+        let fixed = 4 + 8 + 4 + 8 + 4; // user_id(i32) + timestamp(i64) + quantity(i32) + amount(f64) + per-field overhead
+        let strings = self.id.len() + self.region.len() + self.product_category.len()
+            + self.event_type.len() + self.user_segment.len() + self.metadata.len()
+            + self.objects.iter().map(|s| s.len()).sum::<usize>();
+        // Each field has a 4-byte length prefix in the PG wire protocol
+        let num_fields = 10 + self.objects.len();
+        fixed + strings + num_fields * 4
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct PercentileStats {
     avg: f64,
@@ -123,6 +136,7 @@ struct BenchmarkMonitor {
     total_rows: AtomicU64,
     total_batches: AtomicU64,
     total_errors: AtomicU64,
+    total_bytes_sent: AtomicU64,
     rate_samples: Mutex<Vec<f64>>,
     latency_samples: Mutex<Vec<f64>>,
 }
@@ -137,14 +151,16 @@ impl BenchmarkMonitor {
             total_rows: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
+            total_bytes_sent: AtomicU64::new(0),
             rate_samples: Mutex::new(Vec::new()),
             latency_samples: Mutex::new(Vec::new()),
         }
     }
 
-    fn add_batch(&self, rows: usize, latency_ms: f64) {
+    fn add_batch(&self, rows: usize, bytes_sent: usize, latency_ms: f64) {
         self.total_rows.fetch_add(rows as u64, Ordering::Relaxed);
         self.total_batches.fetch_add(1, Ordering::Relaxed);
+        self.total_bytes_sent.fetch_add(bytes_sent as u64, Ordering::Relaxed);
         self.latency_samples
             .lock()
             .expect("latency_samples lock poisoned")
@@ -788,6 +804,9 @@ fn build_report(
     let rate_stats = monitor.rate_stats();
     let latency_stats = monitor.latency_stats();
     let final_stats = monitor.final_stats();
+    let total_bytes_sent = monitor.total_bytes_sent.load(Ordering::Relaxed);
+    let total_records = final_stats.get("total_records").and_then(|v| v.as_u64()).unwrap_or(0);
+    let runtime_seconds = final_stats.get("runtime_seconds").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let total_cpus = cluster_info
         .get("total_cpus")
         .and_then(|v| v.as_i64())
@@ -830,8 +849,8 @@ fn build_report(
             "records_per_second": rate_stats,
             "records_per_cpu_second": per_cpu,
             "request_latency_ms": latency_stats,
-            "bytes_sent": 0,
-            "bandwidth_mbps": 0.0,
+            "bytes_sent": total_bytes_sent,
+            "bandwidth_mbps": if runtime_seconds > 0.0 { (total_bytes_sent as f64 * 8.0 / 1_000_000.0 / runtime_seconds * 100.0).round() / 100.0 } else { 0.0 },
             "verified_count": verified_count,
             "rejected_writes": rejected_writes,
             "rejected_pct": if final_stats.get("total_records").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
@@ -841,6 +860,7 @@ fn build_report(
             "error_rate_pct": (monitor.error_rate_pct() * 10.0).round() / 10.0,
             "final_concurrency": final_concurrency,
             "avg_row_bytes_on_disk": avg_row_bytes,
+            "avg_payload_bytes": if total_records > 0 { total_bytes_sent / total_records } else { 0 },
         }
     })
 }
@@ -1152,9 +1172,11 @@ fn worker(
             limiter.acquire();
         }
 
+        let batch_bytes: usize = records.iter().map(|r| r.estimated_wire_bytes()).sum();
+
         match execute_batch(&mut client, &stmt, &records, object_count) {
             Ok((inserted, latency_ms)) => {
-                monitor.add_batch(inserted as usize, latency_ms);
+                monitor.add_batch(inserted as usize, batch_bytes, latency_ms);
             }
             Err(err) => {
                 tracing::error!("Worker {worker_id} error: {err:#}");
