@@ -783,6 +783,7 @@ fn build_report(
     verified_count: u64,
     rejected_writes: u64,
     final_concurrency: usize,
+    avg_row_bytes: u64,
 ) -> JsonValue {
     let rate_stats = monitor.rate_stats();
     let latency_stats = monitor.latency_stats();
@@ -839,6 +840,7 @@ fn build_report(
             "average_batch_size": monitor.average_batch_size(),
             "error_rate_pct": (monitor.error_rate_pct() * 10.0).round() / 10.0,
             "final_concurrency": final_concurrency,
+            "avg_row_bytes_on_disk": avg_row_bytes,
         }
     })
 }
@@ -1032,6 +1034,15 @@ fn main() -> Result<()> {
     let _ = admin_client.batch_execute(&format!("REFRESH TABLE {}", quote_ident(&cli.table_name)));
     let verified_count = query_single_i64(&mut admin_client, &format!("SELECT COUNT(*) FROM {}", quote_ident(&cli.table_name))).unwrap_or(0).max(0) as u64;
 
+    // Query average row size on disk
+    let avg_row_bytes = query_single_i64(
+        &mut admin_client,
+        &format!(
+            "SELECT CASE WHEN SUM(num_docs) > 0 THEN ROUND(SUM(size)::double precision / SUM(num_docs), 0) ELSE 0 END FROM sys.shards WHERE table_name = '{}' AND primary = true",
+            cli.table_name
+        ),
+    ).unwrap_or(0).max(0) as u64;
+
     if cli.benchmark {
         let mut cluster_with_tp = cluster_info.clone();
         if let Some(ref tp) = thread_pool_stats {
@@ -1046,6 +1057,7 @@ fn main() -> Result<()> {
             verified_count.saturating_sub(pre_count),
             rejected_writes,
             limiter.current_max(),
+            avg_row_bytes,
         );
         println!("{}", serde_json::to_string(&report).unwrap());
 
@@ -1077,8 +1089,8 @@ fn main() -> Result<()> {
             String::new()
         };
         eprintln!(
-            "CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0} | effective rec/cpu/s={:.0}{}",
-            version, total_cpus, rate_stats.p90, avg, p95, max, effective_rec_per_cpu, rej_str
+            "CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0} | effective rec/cpu/s={:.0} | avg_row={}B{}",
+            version, total_cpus, rate_stats.p90, avg, p95, max, effective_rec_per_cpu, avg_row_bytes, rej_str
         );
     } else {
         info!("inserted {rows} rows in {elapsed:.2}s ({rps:.0} rows/sec), errors={err_count}");
