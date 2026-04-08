@@ -273,6 +273,7 @@ fn find_write_pool(value: Option<&serde_json::Value>) -> Option<&serde_json::Map
 struct NodeSample {
     active: u64,
     queue: u64,
+    cpu: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +290,7 @@ pub struct NodeThreadPoolStats {
     pub pool_size: u64,
     pub active: PercentileStats,
     pub queued: PercentileStats,
+    pub cpu_usage: PercentileStats,
     pub completed_delta: u64,
     pub rejected_delta: u64,
 }
@@ -300,6 +302,7 @@ pub struct ClusterThreadPoolStats {
     pub total_rejected: u64,
     pub active_threads: PercentileStats,
     pub queued_tasks: PercentileStats,
+    pub cpu_usage: PercentileStats,
     pub samples: usize,
     pub nodes: Vec<NodeThreadPoolStats>,
 }
@@ -310,6 +313,14 @@ pub struct QueueThrottleConfig {
     pub enabled: bool,
     pub capacity: u64,
     pub threshold_pct: f64,
+}
+
+/// Configuration for CPU-based throttling.
+#[derive(Debug, Clone)]
+pub struct CpuThrottleConfig {
+    pub enabled: bool,
+    /// Target max CPU percentage across the cluster (0.0 - 1.0)
+    pub max_cpu_pct: f64,
 }
 
 /// Monitors CrateDB write thread pool by polling sys.nodes during the benchmark.
@@ -350,30 +361,27 @@ impl ThreadPoolMonitor {
     pub fn spawn_poller(
         &self,
         mut shutdown_rx: broadcast::Receiver<()>,
-        throttle_config: QueueThrottleConfig,
+        queue_throttle: QueueThrottleConfig,
+        cpu_throttle: CpuThrottleConfig,
     ) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let samples = self.samples.clone();
         let sem = self.concurrency_sem.clone();
         let current_concurrency = self.current_concurrency.clone();
         let max_concurrency = current_concurrency.load(Ordering::Relaxed) as usize;
+        let min_concurrency = (max_concurrency as f64 * 0.25).ceil() as usize;
         let total_permits = self.total_permits;
+        let either_throttle = queue_throttle.enabled || cpu_throttle.enabled;
 
         tokio::spawn(async move {
-            // Grab reserve permits: hold (SEM_TOTAL - max_concurrency) so workers
-            // only see max_concurrency available. We use forget() to permanently
-            // remove permits; add_permits() to give them back.
             let reserve = total_permits - max_concurrency;
             sem.acquire_many(reserve as u32).await.expect("semaphore closed").forget();
-            // Now sem has exactly max_concurrency permits available.
-            // Track how many we've additionally stolen beyond the initial reserve.
             let mut extra_stolen: usize = 0;
 
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
-                        // Restore all stolen permits on shutdown
                         if extra_stolen > 0 {
                             sem.add_permits(extra_stolen);
                         }
@@ -381,46 +389,73 @@ impl ThreadPoolMonitor {
                     },
                     _ = interval.tick() => {
                         if let Ok(rows) = client.execute_query(
-                            "SELECT name, thread_pools FROM sys.nodes ORDER BY name"
+                            "SELECT name, thread_pools, process['cpu']['percent'] FROM sys.nodes ORDER BY name"
                         ).await {
                             let mut total_queue: u64 = 0;
+                            let mut total_cpu: f64 = 0.0;
                             let mut node_count: u64 = 0;
                             let mut smap = samples.write().await;
                             for row in &rows {
                                 let name = row.first().and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                                let cpu = row.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                total_cpu += cpu;
                                 if let Some(pool) = find_write_pool(row.get(1)) {
                                     let active = pool.get("active").and_then(|v| v.as_u64()).unwrap_or(0);
                                     let queue = pool.get("queue").and_then(|v| v.as_u64()).unwrap_or(0);
                                     total_queue += queue;
                                     node_count += 1;
-                                    smap.entry(name).or_default().push(NodeSample { active, queue });
+                                    smap.entry(name).or_default().push(NodeSample { active, queue, cpu });
                                 }
                             }
                             drop(smap);
 
-                            if throttle_config.enabled && node_count > 0 {
-                                let avg_queue = total_queue as f64 / node_count as f64;
-                                let queue_pct = avg_queue / throttle_config.capacity as f64;
-
-                                let desired = if queue_pct > throttle_config.threshold_pct {
-                                    let pressure = (queue_pct - throttle_config.threshold_pct)
-                                        / (1.0 - throttle_config.threshold_pct);
-                                    let min_concurrency = (max_concurrency as f64 * 0.25).ceil() as usize;
-                                    let target = max_concurrency as f64 - pressure * (max_concurrency - min_concurrency) as f64;
-                                    (target as usize).max(min_concurrency)
-                                } else if queue_pct < throttle_config.threshold_pct * 0.5 {
-                                    // Well below threshold: restore 1 per tick
-                                    let current = max_concurrency - extra_stolen;
-                                    (current + 1).min(max_concurrency)
-                                } else {
-                                    max_concurrency - extra_stolen
-                                };
-
+                            if either_throttle && node_count > 0 {
                                 let current = max_concurrency - extra_stolen;
 
+                                // Queue-based desired concurrency
+                                let queue_desired = if queue_throttle.enabled {
+                                    let avg_queue = total_queue as f64 / node_count as f64;
+                                    let queue_pct = avg_queue / queue_throttle.capacity as f64;
+
+                                    if queue_pct > queue_throttle.threshold_pct {
+                                        let pressure = (queue_pct - queue_throttle.threshold_pct)
+                                            / (1.0 - queue_throttle.threshold_pct);
+                                        let target = max_concurrency as f64 - pressure * (max_concurrency - min_concurrency) as f64;
+                                        (target as usize).max(min_concurrency)
+                                    } else if queue_pct < queue_throttle.threshold_pct * 0.5 {
+                                        (current + 1).min(max_concurrency)
+                                    } else {
+                                        current
+                                    }
+                                } else {
+                                    max_concurrency
+                                };
+
+                                // CPU-based desired concurrency
+                                let cpu_desired = if cpu_throttle.enabled {
+                                    let avg_cpu = total_cpu / node_count as f64 / 100.0; // 0.0-1.0
+
+                                    if avg_cpu > cpu_throttle.max_cpu_pct {
+                                        // Over target: reduce proportionally
+                                        // e.g., at 50% CPU with 25% target → overshoot=1.0 → min concurrency
+                                        let overshoot = (avg_cpu - cpu_throttle.max_cpu_pct)
+                                            / (1.0 - cpu_throttle.max_cpu_pct);
+                                        let target = max_concurrency as f64 - overshoot * (max_concurrency - min_concurrency) as f64;
+                                        (target as usize).max(min_concurrency)
+                                    } else if avg_cpu < cpu_throttle.max_cpu_pct * 0.5 {
+                                        // Well below target: restore 1 per tick
+                                        (current + 1).min(max_concurrency)
+                                    } else {
+                                        current
+                                    }
+                                } else {
+                                    max_concurrency
+                                };
+
+                                // Take the more restrictive of the two
+                                let desired = queue_desired.min(cpu_desired);
+
                                 if desired < current {
-                                    // Steal permits one at a time — workers hold most permits,
-                                    // so we grab each one as it becomes briefly available.
                                     let to_steal = current - desired;
                                     for _ in 0..to_steal {
                                         match tokio::time::timeout(
@@ -431,11 +466,10 @@ impl ThreadPoolMonitor {
                                                 permit.forget();
                                                 extra_stolen += 1;
                                             }
-                                            _ => break, // timeout or closed, try again next tick
+                                            _ => break,
                                         }
                                     }
                                 } else if desired > current && extra_stolen > 0 {
-                                    // Release permits back
                                     let to_release = (desired - current).min(extra_stolen);
                                     sem.add_permits(to_release);
                                     extra_stolen -= to_release;
@@ -503,6 +537,9 @@ impl ThreadPoolMonitor {
             let queue_vals: Vec<f64> = node_samples
                 .map(|s| s.iter().map(|ns| ns.queue as f64).collect())
                 .unwrap_or_default();
+            let cpu_vals: Vec<f64> = node_samples
+                .map(|s| s.iter().map(|ns| ns.cpu).collect())
+                .unwrap_or_default();
 
             if let Some(s) = node_samples {
                 num_samples = num_samples.max(s.len());
@@ -513,6 +550,7 @@ impl ThreadPoolMonitor {
                 pool_size: fc.pool_size,
                 active: compute_percentiles(&active_vals),
                 queued: compute_percentiles(&queue_vals),
+                cpu_usage: compute_percentiles(&cpu_vals),
                 completed_delta,
                 rejected_delta,
             });
@@ -529,6 +567,14 @@ impl ThreadPoolMonitor {
                 samples.values().filter_map(|v| v.get(i)).map(|s| s.queue as f64).sum()
             })
             .collect();
+        // CPU: average across nodes (not sum)
+        let node_count = samples.len().max(1) as f64;
+        let cluster_cpu: Vec<f64> = (0..num_samples)
+            .map(|i| {
+                let sum: f64 = samples.values().filter_map(|v| v.get(i)).map(|s| s.cpu).sum();
+                sum / node_count
+            })
+            .collect();
 
         Some(ClusterThreadPoolStats {
             total_pool_size,
@@ -536,6 +582,7 @@ impl ThreadPoolMonitor {
             total_rejected,
             active_threads: compute_percentiles(&cluster_active),
             queued_tasks: compute_percentiles(&cluster_queue),
+            cpu_usage: compute_percentiles(&cluster_cpu),
             samples: num_samples,
             nodes,
         })
