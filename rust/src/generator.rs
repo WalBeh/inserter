@@ -1,8 +1,7 @@
 use chrono::{DateTime, Utc};
-use fake::Fake;
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
@@ -21,25 +20,30 @@ pub struct Record {
 
 #[derive(Clone)]
 pub struct RecordGenerator {
-    regions: Vec<&'static str>,
-    product_categories: Vec<&'static str>,
-    event_types: Vec<&'static str>,
-    user_segments: Vec<&'static str>,
+    rng: SmallRng,
+    worker_tag: u64,
+    sequence: u64,
+    regions: [&'static str; 4],
+    product_categories: [&'static str; 5],
+    event_types: [&'static str; 5],
+    user_segments: [&'static str; 4],
     object_values: Vec<Vec<String>>,
     num_objects: usize,
 }
 
 impl RecordGenerator {
     pub fn new(num_objects: usize) -> Self {
-        let regions = vec!["us-east", "us-west", "eu-central", "ap-southeast"];
-        let product_categories = vec!["electronics", "books", "clothing", "home", "sports"];
-        let event_types = vec!["view", "click", "purchase", "cart_add", "cart_remove"];
-        let user_segments = vec!["premium", "standard", "basic", "trial"];
+        let mut rng = SmallRng::from_entropy();
+        let worker_tag = rng.gen::<u64>();
 
-        // Generate object values for each object column
+        let regions = ["us-east", "us-west", "eu-central", "ap-southeast"];
+        let product_categories = ["electronics", "books", "clothing", "home", "sports"];
+        let event_types = ["view", "click", "purchase", "cart_add", "cart_remove"];
+        let user_segments = ["premium", "standard", "basic", "trial"];
+
         let mut object_values = Vec::with_capacity(num_objects);
         for i in 0..num_objects {
-            let num_vals = (3..=8).fake::<usize>();
+            let num_vals = rng.gen_range(3..=8);
             let mut vals = Vec::with_capacity(num_vals);
             for j in 0..num_vals {
                 vals.push(format!("obj{}_val_{}", i, j));
@@ -48,6 +52,9 @@ impl RecordGenerator {
         }
 
         Self {
+            rng,
+            worker_tag,
+            sequence: 0,
             regions,
             product_categories,
             event_types,
@@ -57,36 +64,37 @@ impl RecordGenerator {
         }
     }
 
-    pub fn generate_record(&self) -> Record {
-        let id = Uuid::new_v4().to_string();
+    #[inline]
+    fn next_id(&mut self) -> String {
+        self.sequence = self.sequence.wrapping_add(1);
+        format!("{:016x}{:016x}", self.worker_tag, self.sequence)
+    }
+
+    pub fn generate_record(&mut self) -> Record {
+        let id = self.next_id();
         let timestamp = Utc::now();
 
-        // Select random values with controlled cardinality
-        let region = self.regions[(0..self.regions.len()).fake::<usize>()];
-        let product_category =
-            self.product_categories[(0..self.product_categories.len()).fake::<usize>()];
-        let event_type = self.event_types[(0..self.event_types.len()).fake::<usize>()];
-        let user_segment = self.user_segments[(0..self.user_segments.len()).fake::<usize>()];
+        let region = self.regions[self.rng.gen_range(0..self.regions.len())];
+        let product_category = self.product_categories[self.rng.gen_range(0..self.product_categories.len())];
+        let event_type = self.event_types[self.rng.gen_range(0..self.event_types.len())];
+        let user_segment = self.user_segments[self.rng.gen_range(0..self.user_segments.len())];
 
-        // Generate random values
-        let user_id: u32 = (1..=10000).fake();
-        let amount: f64 = (1.0..1000.0).fake();
-        let quantity: u32 = (1..=100).fake();
+        let user_id: u32 = self.rng.gen_range(1..=10000);
+        let amount: f64 = self.rng.gen_range(1.0..1000.0);
+        let quantity: u32 = self.rng.gen_range(1..=100);
 
-        // Generate metadata object
         let metadata = json!({
-            "browser": format!("Browser-{}", (1..=5).fake::<u32>()),
-            "os": format!("OS-{}", (1..=3).fake::<u32>()),
-            "session_id": Uuid::new_v4().to_string(),
-            "page_views": (1..=20).fake::<u32>(),
-            "referrer": format!("ref-{}", (1..=10).fake::<u32>())
+            "browser": format!("Browser-{}", self.rng.gen_range(1..=5u32)),
+            "os": format!("OS-{}", self.rng.gen_range(1..=3u32)),
+            "session_id": format!("{:016x}{:016x}", self.worker_tag, self.sequence),
+            "page_views": self.rng.gen_range(1..=20u32),
+            "referrer": format!("ref-{}", self.rng.gen_range(1..=10u32))
         });
 
-        // Generate object column values
         let mut objects = Vec::with_capacity(self.num_objects);
         for i in 0..self.num_objects {
             if let Some(vals) = self.object_values.get(i) {
-                let idx = (0..vals.len()).fake::<usize>();
+                let idx = self.rng.gen_range(0..vals.len());
                 objects.push(vals[idx].clone());
             } else {
                 objects.push(format!("default_obj_{}", i));
@@ -108,7 +116,7 @@ impl RecordGenerator {
         }
     }
 
-    pub fn generate_batch(&self, batch_size: usize) -> Vec<Record> {
+    pub fn generate_batch(&mut self, batch_size: usize) -> Vec<Record> {
         let mut batch = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             batch.push(self.generate_record());
@@ -130,10 +138,9 @@ impl Record {
             Value::String(self.user_segment),
             json!(self.amount),
             json!(self.quantity),
-            self.metadata, // moved, not cloned
+            self.metadata,
         ];
 
-        // Add object columns
         for obj_val in self.objects {
             params.push(Value::String(obj_val));
         }
@@ -148,10 +155,11 @@ mod tests {
 
     #[test]
     fn test_record_generation() {
-        let generator = RecordGenerator::new(0);
+        let mut generator = RecordGenerator::new(0);
         let record = generator.generate_record();
 
         assert!(!record.id.is_empty());
+        assert_eq!(record.id.len(), 32); // hex counter format
         assert!(record.user_id >= 1 && record.user_id <= 10000);
         assert!(record.amount >= 1.0 && record.amount <= 1000.0);
         assert!(record.quantity >= 1 && record.quantity <= 100);
@@ -160,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_record_generation_with_objects() {
-        let generator = RecordGenerator::new(3);
+        let mut generator = RecordGenerator::new(3);
         let record = generator.generate_record();
 
         assert_eq!(record.objects.len(), 3);
@@ -171,12 +179,11 @@ mod tests {
 
     #[test]
     fn test_batch_generation() {
-        let generator = RecordGenerator::new(2);
+        let mut generator = RecordGenerator::new(2);
         let batch = generator.generate_batch(10);
 
         assert_eq!(batch.len(), 10);
 
-        // Verify all records have unique IDs
         let mut ids = std::collections::HashSet::new();
         for record in &batch {
             assert!(ids.insert(record.id.clone()));

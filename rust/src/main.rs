@@ -374,7 +374,7 @@ async fn run_data_generation(
     for worker_id in 0..config.threads {
         let client = client.clone();
         let monitor = monitor.clone();
-        let generator = RecordGenerator::new(config.objects);
+        let generator = Arc::new(std::sync::Mutex::new(RecordGenerator::new(config.objects)));
         let insert_sql = insert_sql.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let worker_state = shared_worker_state.clone();
@@ -398,7 +398,7 @@ async fn run_data_generation(
                         // Generate batch + convert to params on blocking thread
                         let gen = generator.clone();
                         let params = tokio::task::spawn_blocking(move || {
-                            let batch = gen.generate_batch(batch_size);
+                            let batch = gen.lock().expect("generator lock poisoned").generate_batch(batch_size);
                             batch.into_iter()
                                 .map(|record| record.into_params())
                                 .collect::<Vec<Vec<serde_json::Value>>>()
@@ -576,6 +576,17 @@ async fn run_data_generation(
         .map(|tp| tp.total_rejected)
         .unwrap_or(0);
 
+    // Query average row size on disk
+    let avg_row_bytes = client
+        .execute_query(&format!(
+            "SELECT CASE WHEN SUM(num_docs) > 0 THEN SUM(size) / SUM(num_docs) ELSE 0 END FROM sys.shards WHERE table_name = '{}' AND primary = true",
+            table_name
+        ))
+        .await
+        .ok()
+        .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))))
+        .unwrap_or(0);
+
     if benchmark {
         // Benchmark mode: JSONL to stdout
         let rate_stats = monitor.get_percentile_stats().await;
@@ -646,6 +657,8 @@ async fn run_data_generation(
                 "average_batch_size": monitor.get_average_batch_size(),
                 "error_rate_pct": (monitor.get_error_rate().await * 10.0).round() / 10.0,
                 "final_concurrency": tp_monitor.current_concurrency.load(Ordering::Relaxed),
+                "avg_row_bytes_on_disk": avg_row_bytes,
+                "avg_payload_bytes": if final_stats.total_records > 0 { bytes_sent / final_stats.total_records } else { 0 },
             }
         });
         println!("{}", serde_json::to_string(&result).unwrap());
@@ -673,8 +686,8 @@ async fn run_data_generation(
             String::new()
         };
         eprintln!(
-            "CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0} | effective rec/cpu/s={:.0}{}",
-            version, total_cpus_int, rate_stats.p90, avg, p95, max, effective_rec_per_cpu, rej_str
+            "CrateDB {} | {} CPUs | p90={:.0} rec/s | per CPU: avg={:.0} p95={:.0} max={:.0} | effective rec/cpu/s={:.0} | avg_row={}B{}",
+            version, total_cpus_int, rate_stats.p90, avg, p95, max, effective_rec_per_cpu, avg_row_bytes, rej_str
         );
     } else {
         // Normal mode
