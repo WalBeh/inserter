@@ -579,12 +579,12 @@ async fn run_data_generation(
     // Query average row size on disk
     let avg_row_bytes = client
         .execute_query(&format!(
-            "SELECT CASE WHEN SUM(num_docs) > 0 THEN ROUND(SUM(size)::double precision / SUM(num_docs), 0) ELSE 0 END FROM sys.shards WHERE table_name = '{}' AND primary = true",
+            "SELECT CASE WHEN SUM(num_docs) > 0 THEN SUM(size) / SUM(num_docs) ELSE 0 END FROM sys.shards WHERE table_name = '{}' AND primary = true",
             table_name
         ))
         .await
         .ok()
-        .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64())))
+        .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))))
         .unwrap_or(0);
 
     if benchmark {

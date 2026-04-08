@@ -1058,7 +1058,7 @@ fn main() -> Result<()> {
     let avg_row_bytes = query_single_i64(
         &mut admin_client,
         &format!(
-            "SELECT CASE WHEN SUM(num_docs) > 0 THEN ROUND(SUM(size)::double precision / SUM(num_docs), 0) ELSE 0 END FROM sys.shards WHERE table_name = '{}' AND primary = true",
+            "SELECT CASE WHEN SUM(num_docs) > 0 THEN (SUM(size) / SUM(num_docs))::bigint ELSE 0 END FROM sys.shards WHERE table_name = '{}' AND primary = true",
             cli.table_name
         ),
     ).unwrap_or(0).max(0) as u64;
