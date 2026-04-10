@@ -144,6 +144,13 @@ struct Cli {
     /// Target max cluster CPU percentage (default: 50)
     #[arg(long, default_value_t = 50)]
     max_cpu_load_pct: u64,
+
+    /// Extra WITH options appended to CREATE TABLE, as comma-separated key=value pairs.
+    /// Keys containing '.' are automatically double-quoted. String values are
+    /// automatically single-quoted — do NOT add SQL quotes yourself.
+    /// Example: "translog.durability=ASYNC,translog.flush_threshold_size=512mb"
+    #[arg(long)]
+    table_options: Option<String>,
 }
 
 fn sanitize_connection_string(connection_string: &str) -> String {
@@ -160,12 +167,105 @@ fn sanitize_connection_string(connection_string: &str) -> String {
     }
 }
 
+fn parse_kv_pair(s: &str) -> Result<(String, String)> {
+    let eq = s.find('=').ok_or_else(|| anyhow::anyhow!(
+        "invalid table option {:?}: expected key=value", s
+    ))?;
+    let key = s[..eq].trim().to_string();
+    let value = s[eq + 1..].trim().to_string();
+    if key.is_empty() {
+        anyhow::bail!("empty key in table option {:?}", s);
+    }
+    if value.is_empty() {
+        anyhow::bail!("empty value in table option {:?}", s);
+    }
+    Ok((key, value))
+}
+
+fn parse_table_options(s: &str) -> Result<Vec<(String, String)>> {
+    let mut result = Vec::new();
+    let mut token = String::new();
+    let mut in_quotes = false;
+
+    for ch in s.chars() {
+        match ch {
+            '\'' => {
+                in_quotes = !in_quotes;
+                token.push(ch);
+            }
+            ',' if !in_quotes => {
+                let pair = token.trim().to_string();
+                if !pair.is_empty() {
+                    result.push(parse_kv_pair(&pair)?);
+                }
+                token.clear();
+            }
+            _ => token.push(ch),
+        }
+    }
+    if in_quotes {
+        anyhow::bail!("unterminated single quote in --table-options");
+    }
+    let pair = token.trim().to_string();
+    if !pair.is_empty() {
+        result.push(parse_kv_pair(&pair)?);
+    }
+    Ok(result)
+}
+
+/// Wrap a bare value in single quotes for SQL unless it is already quoted,
+/// a plain integer/float, or a boolean.  This lets callers pass raw values
+/// (e.g. `10s`, `ASYNC`) without worrying about SQL string literals, which
+/// is important because shell quoting inside `bash -c "..."` strips single
+/// quotes before the binary ever sees them.
+fn to_sql_value(v: &str) -> String {
+    if (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+        || v.parse::<i64>().is_ok()
+        || v.parse::<f64>().is_ok()
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("false")
+    {
+        v.to_string()
+    } else {
+        format!("'{}'", v)
+    }
+}
+
+fn build_with_clause(replicas: usize, table_options: &[(String, String)]) -> String {
+    let mut parts = vec![format!("number_of_replicas = {}", replicas)];
+    for (key, value) in table_options {
+        let quoted_key = if key.contains('.') {
+            format!("\"{}\"", key)
+        } else {
+            key.clone()
+        };
+        parts.push(format!("{} = {}", quoted_key, to_sql_value(value)));
+    }
+    parts.join(", ")
+}
+
+fn table_options_to_json(opts: &[(String, String)]) -> serde_json::Value {
+    let map: serde_json::Map<String, serde_json::Value> = opts
+        .iter()
+        .map(|(k, v)| {
+            let val = if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2 {
+                serde_json::Value::String(v[1..v.len() - 1].to_string())
+            } else {
+                serde_json::Value::String(v.clone())
+            };
+            (k.clone(), val)
+        })
+        .collect();
+    serde_json::Value::Object(map)
+}
+
 async fn create_table(
     client: &CrateClient,
     table_name: &str,
     objects: usize,
     shards: usize,
     replicas: usize,
+    table_options: &[(String, String)],
 ) -> Result<()> {
     let mut columns = vec![
         "id TEXT PRIMARY KEY".to_string(),
@@ -186,14 +286,15 @@ async fn create_table(
     }
 
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {} ({}) CLUSTERED INTO {} SHARDS WITH (number_of_replicas = {})",
+        "CREATE TABLE IF NOT EXISTS {} ({}) CLUSTERED INTO {} SHARDS WITH ({})",
         table_name,
         columns.join(", "),
         shards,
-        replicas
+        build_with_clause(replicas, table_options)
     );
 
     info!("Creating table: {}", table_name);
+    debug!("CREATE TABLE SQL: {}", sql);
     client
         .execute(&sql, &[])
         .await
@@ -308,6 +409,7 @@ async fn run_data_generation(
         config.objects,
         config.shards,
         config.replicas,
+        &config.table_options,
     )
     .await?;
 
@@ -611,7 +713,7 @@ async fn run_data_generation(
             cluster_with_tp["write_thread_pool"] = serde_json::json!(tp);
         }
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "client": "rust-http",
             "cluster": cluster_with_tp,
@@ -661,6 +763,9 @@ async fn run_data_generation(
                 "avg_payload_bytes": if final_stats.total_records > 0 { bytes_sent / final_stats.total_records } else { 0 },
             }
         });
+        if !config.table_options.is_empty() {
+            result["config"]["table_options"] = table_options_to_json(&config.table_options);
+        }
         println!("{}", serde_json::to_string(&result).unwrap());
         // Summary to stderr for quick reading
         let version = cluster_info
@@ -1198,6 +1303,10 @@ async fn main() -> Result<()> {
     }
     if let Some(replicas) = cli.replicas {
         config.replicas = replicas;
+    }
+    if let Some(ref raw) = cli.table_options {
+        config.table_options = parse_table_options(raw)
+            .context("invalid --table-options")?;
     }
 
     // Adaptive batching CLI overrides

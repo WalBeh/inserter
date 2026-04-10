@@ -92,9 +92,28 @@ Both implementations accept the same flags:
 --batch-interval        Delay between batches: seconds (Python) / ms (Rust)
 --threads               Concurrent async tasks (default: 1)
 --objects               Extra low-cardinality TEXT columns (default: 0)
+--shards                Number of shards for table creation (default: 4)
+--replicas              Number of replicas for table creation (default: 1)
+--table-options         Extra WITH options for CREATE TABLE (Rust only, see below)
 --test-loadbalancer     Run 5-tuple load balancer test and exit
 --benchmark             Minimal output, JSONL result to stdout
 ```
+
+### `--table-options` (Rust only)
+
+Appends extra parameters to the `CREATE TABLE … WITH (…)` clause as comma-separated `key=value` pairs. Keys containing `.` are automatically double-quoted. String values are automatically single-quoted — do not add SQL quotes yourself.
+
+```bash
+--table-options "translog.durability=ASYNC,translog.sync_interval=10s,translog.flush_threshold_size=512mb"
+```
+
+Generates:
+
+```sql
+WITH (number_of_replicas = 0, "translog.durability" = 'ASYNC', "translog.sync_interval" = '10s', "translog.flush_threshold_size" = '512mb')
+```
+
+When `--benchmark` is set, the active options appear in the JSON output under `config.table_options`.
 
 ## Benchmark Mode
 
@@ -132,7 +151,10 @@ CREATE TABLE IF NOT EXISTS your_table (
     quantity INTEGER,
     metadata OBJECT(DYNAMIC)
     -- obj_0 TEXT, obj_1 TEXT, ... when using --objects
-) WITH (number_of_replicas = 1)
+) WITH (
+    number_of_replicas = 1
+    -- extra WITH options injected via --table-options (Rust)
+)
 ```
 
 ## Performance Tuning
