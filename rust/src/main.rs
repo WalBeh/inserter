@@ -146,8 +146,9 @@ struct Cli {
     max_cpu_load_pct: u64,
 
     /// Extra WITH options appended to CREATE TABLE, as comma-separated key=value pairs.
-    /// Keys containing '.' are automatically double-quoted.
-    /// Example: "translog.durability='ASYNC',translog.flush_threshold_size='512mb'"
+    /// Keys containing '.' are automatically double-quoted. String values are
+    /// automatically single-quoted — do NOT add SQL quotes yourself.
+    /// Example: "translog.durability=ASYNC,translog.flush_threshold_size=512mb"
     #[arg(long)]
     table_options: Option<String>,
 }
@@ -212,6 +213,24 @@ fn parse_table_options(s: &str) -> Result<Vec<(String, String)>> {
     Ok(result)
 }
 
+/// Wrap a bare value in single quotes for SQL unless it is already quoted,
+/// a plain integer/float, or a boolean.  This lets callers pass raw values
+/// (e.g. `10s`, `ASYNC`) without worrying about SQL string literals, which
+/// is important because shell quoting inside `bash -c "..."` strips single
+/// quotes before the binary ever sees them.
+fn to_sql_value(v: &str) -> String {
+    if (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+        || v.parse::<i64>().is_ok()
+        || v.parse::<f64>().is_ok()
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("false")
+    {
+        v.to_string()
+    } else {
+        format!("'{}'", v)
+    }
+}
+
 fn build_with_clause(replicas: usize, table_options: &[(String, String)]) -> String {
     let mut parts = vec![format!("number_of_replicas = {}", replicas)];
     for (key, value) in table_options {
@@ -220,7 +239,7 @@ fn build_with_clause(replicas: usize, table_options: &[(String, String)]) -> Str
         } else {
             key.clone()
         };
-        parts.push(format!("{} = {}", quoted_key, value));
+        parts.push(format!("{} = {}", quoted_key, to_sql_value(value)));
     }
     parts.join(", ")
 }
