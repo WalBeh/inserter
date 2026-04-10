@@ -275,6 +275,7 @@ async fn create_table(
     );
 
     info!("Creating table: {}", table_name);
+    debug!("CREATE TABLE SQL: {}", sql);
     client
         .execute(&sql, &[])
         .await
