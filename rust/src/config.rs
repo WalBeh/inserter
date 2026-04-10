@@ -36,6 +36,10 @@ pub struct Config {
     pub shards: usize,
     #[serde(default = "default_replicas")]
     pub replicas: usize,
+    /// Extra WITH options injected into CREATE TABLE, parsed from --table-options.
+    /// Skipped in config files; populated from CLI only.
+    #[serde(skip)]
+    pub table_options: Vec<(String, String)>,
     #[cfg(feature = "dashboard")]
     pub dashboard: bool,
     pub log_level: String,
@@ -87,6 +91,7 @@ impl Default for Config {
             objects: 0,
             shards: 4,
             replicas: 1,
+            table_options: Vec::new(),
             adaptive_batching: default_adaptive_batching(),
             min_batch_size: default_min_batch_size(),
             max_batch_size: default_max_batch_size(),
