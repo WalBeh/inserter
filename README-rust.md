@@ -83,6 +83,9 @@ cargo build --release
 --batch-interval <MS>         Milliseconds between batches (0 = none)
 --threads <COUNT>             Concurrent async worker tasks
 --objects <COUNT>             Extra low-cardinality TEXT columns
+--shards <N>                  Shards for table creation (default: 4)
+--replicas <N>                Replicas for table creation (default: 1)
+--table-options <KEY=VAL,...> Extra WITH options for CREATE TABLE (see below)
 --test-loadbalancer           Run 5-tuple load balancer test and exit
 --benchmark                   Minimal output, JSONL result to stdout
 --log-level <LEVEL>           error, warn, info, debug, trace
@@ -90,6 +93,31 @@ cargo build --release
 ```
 
 Config file values are defaults — CLI args override only when explicitly provided. Connection string comes from `.env` or `--connection-string`.
+
+### `--table-options`
+
+Appends extra parameters to `CREATE TABLE … WITH (…)` as comma-separated `key=value` pairs. Keys with `.` are automatically double-quoted. String values (non-numeric, non-boolean) are automatically wrapped in single quotes — do not add SQL quoting yourself.
+
+```bash
+./target/release/crate-write \
+  --table-name bench \
+  --duration 2 --threads 32 --batch-size 1000 \
+  --table-options "translog.durability=ASYNC,translog.sync_interval=10s,translog.flush_threshold_size=512mb"
+```
+
+Generated SQL:
+```sql
+WITH (number_of_replicas = 0, "translog.durability" = 'ASYNC', "translog.sync_interval" = '10s', "translog.flush_threshold_size" = '512mb')
+```
+
+With `--benchmark`, the active options appear in the JSON output under `config.table_options`:
+```json
+"table_options": {
+  "translog.durability": "ASYNC",
+  "translog.sync_interval": "10s",
+  "translog.flush_threshold_size": "512mb"
+}
+```
 
 ## Architecture
 
